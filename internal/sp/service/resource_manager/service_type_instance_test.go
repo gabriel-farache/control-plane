@@ -12,6 +12,7 @@ import (
 	rmsvc "github.com/dcm-project/control-plane/internal/sp/service/resource_manager"
 	"github.com/dcm-project/control-plane/internal/sp/store"
 	"github.com/dcm-project/control-plane/internal/sp/store/model"
+	rmstore "github.com/dcm-project/control-plane/internal/sp/store/resource_manager"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go/jetstream"
 	. "github.com/onsi/ginkgo/v2"
@@ -31,7 +32,50 @@ func (s *stubJetStream) Publish(_ context.Context, _ string, _ []byte, _ ...jets
 	return &jetstream.PubAck{}, nil
 }
 
+// failingJetStream mirrors stubJetStream but fails every publish, so tests
+// can exercise the "publish to agent fails" path without a real NATS server.
+type failingJetStream struct {
+	jetstream.JetStream
+}
+
+func (f *failingJetStream) Publish(_ context.Context, _ string, _ []byte, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	return nil, errors.New("nats: publish failed")
+}
+
 func ptrString(s string) *string { return &s }
+
+// resetRetryCountFailingStore forces ResetRetryCount to fail, delegating
+// every other method to the embedded real store.
+type resetRetryCountFailingStore struct {
+	rmstore.ServiceTypeInstance
+	err error
+}
+
+func (f *resetRetryCountFailingStore) ResetRetryCount(_ context.Context, _ string, _ bool) error {
+	return f.err
+}
+
+// updateStatusFailingStore forces UpdateStatus to fail, delegating every
+// other method to the embedded real store.
+type updateStatusFailingStore struct {
+	rmstore.ServiceTypeInstance
+	err error
+}
+
+func (f *updateStatusFailingStore) UpdateStatus(_ context.Context, _ string, _ string, _ string, _ map[string]any) error {
+	return f.err
+}
+
+// storeWithInstance overrides ServiceTypeInstance() to return a decorated
+// sub-store.
+type storeWithInstance struct {
+	store.Store
+	instance rmstore.ServiceTypeInstance
+}
+
+func (s *storeWithInstance) ServiceTypeInstance() rmstore.ServiceTypeInstance {
+	return s.instance
+}
 
 var _ = Describe("InstanceService", func() {
 	var (
@@ -392,6 +436,91 @@ var _ = Describe("InstanceService", func() {
 			Expect(hiddenErr).To(BeAssignableToTypeOf(svcErr))
 			errors.As(hiddenErr, &svcErr)
 			Expect(svcErr.Code).To(Equal(service.ErrCodeNotFound))
+
+			stored, storeErr := dataStore.ServiceTypeInstance().Get(ctx, inst.ID, true)
+			Expect(storeErr).NotTo(HaveOccurred())
+			Expect(stored.HardDelete).To(BeTrue())
+		})
+
+		It("persists HardDelete=true before publish, surviving a publish failure (non-deferred)", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID:           uuid.New().String(),
+				ServiceType:  "vm",
+				Status:       "running",
+				InstanceName: "del-inst-hard-delete-persists",
+				Spec:         map[string]any{"cpu": 2},
+				AgentName:    &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+
+			failingPub := messaging.NewPublisher(&failingJetStream{})
+			failingService := rmsvc.NewInstanceService(dataStore, failingPub, agentStoreImpl.NewAgent(db))
+
+			Expect(failingService.DeleteInstance(ctx, inst.ID, false)).NotTo(HaveOccurred())
+
+			got, getErr := dataStore.ServiceTypeInstance().Get(ctx, inst.ID, true)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(got.DeletionStatus).NotTo(BeNil())
+			Expect(*got.DeletionStatus).To(Equal("SCHEDULED"))
+			Expect(got.HardDelete).To(BeTrue())
+			// The best-effort status write never ran (publish failed
+			// before reaching it), yet the mode is still durably hard.
+			Expect(got.Status).To(Equal("running"))
+		})
+
+		// REQ-DEL-08 AC-1/AC-2: once HardDelete is durably persisted at
+		// enrollment, the post-publish status=deleting write is
+		// observability-only. Its failure must not fail the call, and the
+		// instance must remain correctly enrolled for hard-delete.
+		It("does not fail the call when the post-publish status write fails, and stays enrolled for hard-delete", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID:           uuid.New().String(),
+				ServiceType:  "vm",
+				Status:       "running",
+				InstanceName: "del-inst-status-write-fails",
+				Spec:         map[string]any{"cpu": 2},
+				AgentName:    &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+
+			failingInstanceStore := &updateStatusFailingStore{
+				ServiceTypeInstance: dataStore.ServiceTypeInstance(),
+				err:                 errors.New("db: connection reset"),
+			}
+			failingStore := &storeWithInstance{Store: dataStore, instance: failingInstanceStore}
+			failingService := rmsvc.NewInstanceService(failingStore, messaging.NewPublisher(&stubJetStream{}), agentStoreImpl.NewAgent(db))
+
+			Expect(failingService.DeleteInstance(ctx, inst.ID, false)).NotTo(HaveOccurred())
+
+			got, getErr := dataStore.ServiceTypeInstance().Get(ctx, inst.ID, true)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(got.DeletionStatus).NotTo(BeNil())
+			Expect(*got.DeletionStatus).To(Equal("SCHEDULED"))
+			Expect(got.HardDelete).To(BeTrue())
+			// The status write itself failed, so it never became "deleting" -
+			// this is expected and, per REQ-DEL-08, no longer load-bearing.
+			Expect(got.Status).To(Equal("running"))
+		})
+
+		It("persists HardDelete=false for a deferred delete", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID:           uuid.New().String(),
+				ServiceType:  "vm",
+				Status:       "running",
+				InstanceName: "del-inst-deferred-mode",
+				Spec:         map[string]any{"cpu": 2},
+				AgentName:    &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+
+			Expect(instanceService.DeleteInstance(ctx, inst.ID, true)).NotTo(HaveOccurred())
+
+			got, getErr := dataStore.ServiceTypeInstance().Get(ctx, inst.ID, true)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(got.HardDelete).To(BeFalse())
 		})
 
 		It("hard-deletes immediately when the instance has no agent", func() {
@@ -450,6 +579,95 @@ var _ = Describe("InstanceService", func() {
 			Expect(svcErr.Code).To(Equal(service.ErrCodeNotFound))
 		})
 
+		It("stays SCHEDULED and returns success when publish fails (non-deferred)", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID:           uuid.New().String(),
+				ServiceType:  "vm",
+				Status:       "running",
+				InstanceName: "del-inst-publish-fails",
+				Spec:         map[string]any{"cpu": 2},
+				AgentName:    &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+
+			failingPub := messaging.NewPublisher(&failingJetStream{})
+			failingService := rmsvc.NewInstanceService(dataStore, failingPub, agentStoreImpl.NewAgent(db))
+
+			err := failingService.DeleteInstance(ctx, inst.ID, false)
+			Expect(err).NotTo(HaveOccurred())
+
+			got, getErr := dataStore.ServiceTypeInstance().Get(ctx, inst.ID, true)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(got.DeletionStatus).NotTo(BeNil())
+			Expect(*got.DeletionStatus).To(Equal("SCHEDULED"))
+			Expect(got.Status).To(Equal("running"))
+		})
+
+		It("uses ResetRetryCount on re-delete of an already-SCHEDULED instance (non-deferred)", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID:           uuid.New().String(),
+				ServiceType:  "vm",
+				Status:       "running",
+				InstanceName: "del-inst-redelete",
+				Spec:         map[string]any{"cpu": 2},
+				AgentName:    &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
+
+			before, getErr := dataStore.ServiceTypeInstance().Get(ctx, inst.ID, true)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(before.DeletionRequestedAt).NotTo(BeNil())
+			originalRequestedAt := *before.DeletionRequestedAt
+
+			err := instanceService.DeleteInstance(ctx, inst.ID, false)
+			Expect(err).NotTo(HaveOccurred())
+
+			after, getErr := dataStore.ServiceTypeInstance().Get(ctx, inst.ID, true)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(after.DeletionRequestedAt).NotTo(BeNil())
+			Expect(after.DeletionRequestedAt.Equal(originalRequestedAt)).To(BeTrue())
+			Expect(after.RetryCount).To(Equal(0))
+			// REQ-DEL-07 AC-4: the original enrollment (direct MarkForDeletion
+			// call above) left HardDelete at its zero value (false); this
+			// non-deferred re-delete call must correct it to true via the
+			// SAME ResetRetryCount update, not leave the stale mode in place.
+			Expect(after.HardDelete).To(BeTrue())
+		})
+
+		// A ResetRetryCount failure on re-delete must return an internal error,
+		// not just be logged.
+		It("returns an internal error when ResetRetryCount fails on re-delete", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID:           uuid.New().String(),
+				ServiceType:  "vm",
+				Status:       "running",
+				InstanceName: "del-inst-reset-fails",
+				Spec:         map[string]any{"cpu": 2},
+				AgentName:    &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
+
+			failingInstanceStore := &resetRetryCountFailingStore{
+				ServiceTypeInstance: dataStore.ServiceTypeInstance(),
+				err:                 errors.New("db: connection reset"),
+			}
+			failingStore := &storeWithInstance{instance: failingInstanceStore}
+			failingService := rmsvc.NewInstanceService(failingStore, messaging.NewPublisher(&stubJetStream{}), agentStoreImpl.NewAgent(db))
+
+			err := failingService.DeleteInstance(ctx, inst.ID, false)
+
+			Expect(err).To(HaveOccurred())
+			var svcErr *service.ServiceError
+			Expect(err).To(BeAssignableToTypeOf(svcErr))
+			errors.As(err, &svcErr)
+			Expect(svcErr.Code).To(Equal(service.ErrCodeInternal))
+		})
+
 		It("defers deletion without contacting provider", func() {
 			agentName := "test-agent"
 			inst := model.ServiceTypeInstance{
@@ -486,7 +704,7 @@ var _ = Describe("InstanceService", func() {
 				AgentName:    &agentName,
 			}
 			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
-			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 			Expect(dataStore.ServiceTypeInstance().MarkDeletionComplete(ctx, inst.ID)).To(Succeed())
 
 			got, err := instanceService.GetInstance(ctx, inst.ID, true)
@@ -511,7 +729,7 @@ var _ = Describe("InstanceService", func() {
 				AgentName:    &agentName,
 			}
 			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
-			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 			Expect(dataStore.ServiceTypeInstance().MarkDeletionFailed(ctx, inst.ID)).To(Succeed())
 
 			got, err := instanceService.GetInstance(ctx, inst.ID, true)

@@ -59,7 +59,10 @@ type ServiceTypeInstance interface { //nolint:interfacebloat
 	UpdateStatusFrom(ctx context.Context, instanceID string, fromStatuses []string, agentName string, status string, statusMessage string) (bool, error)
 	MarkQueued(ctx context.Context, id string, agentName string) error
 	ReassignAndReset(ctx context.Context, id string, agentName string, expectedCurrentAgent string) error
-	MarkForDeletion(ctx context.Context, id string) error
+	// MarkForDeletion enrolls id for deletion (deletion_status=SCHEDULED),
+	// persisting hardDelete (see model.ServiceTypeInstance.HardDelete) in
+	// the same update.
+	MarkForDeletion(ctx context.Context, id string, hardDelete bool) error
 	ListPendingDeletions(ctx context.Context) ([]model.ServiceTypeInstance, error)
 	IncrementDeletionRetry(ctx context.Context, id string) error
 	MarkDeletionFailed(ctx context.Context, id string) error
@@ -74,7 +77,20 @@ type ServiceTypeInstance interface { //nolint:interfacebloat
 	// MarkDeletionCompleteFromAgent is MarkDeletionComplete gated by the
 	// currently-assigned agent_name; see HardDeleteFromAgent.
 	MarkDeletionCompleteFromAgent(ctx context.Context, id string, agentName string) error
-	ResetRetryCount(ctx context.Context, id string) error
+	// ResetRetryCount re-enrolls an already-SCHEDULED id without losing
+	// deletion_requested_at, re-persisting hardDelete (see MarkForDeletion).
+	ResetRetryCount(ctx context.Context, id string, hardDelete bool) error
+	// FinalizeDeletionAcknowledged atomically checks still-pending
+	// (SCHEDULED/FAILED/pending_deletion) + agent_name match, then acts on
+	// the current hard_delete, all in one transaction (fixes a TOCTOU race
+	// against concurrent ResetRetryCount). finalized=false, nil error means
+	// "ack, don't retry" (not found, agent mismatch, or already resolved).
+	// wasFailed reports if it was recovering a FAILED row.
+	FinalizeDeletionAcknowledged(ctx context.Context, id, agentName string) (finalized, hardDeleted, wasFailed bool, err error)
+	// FinalizeAuditGiveUp is FinalizeDeletionAcknowledged for the scheduler's
+	// give-up path: same atomic check-and-act, gated on still SCHEDULED, no
+	// agent_name gate.
+	FinalizeAuditGiveUp(ctx context.Context, id string) (finalized, hardDeleted bool, err error)
 }
 
 type ServiceTypeInstanceStore struct {
@@ -320,7 +336,7 @@ const (
 	DeletionStatusDeleted   = "DELETED"
 )
 
-func (s *ServiceTypeInstanceStore) MarkForDeletion(ctx context.Context, id string) error {
+func (s *ServiceTypeInstanceStore) MarkForDeletion(ctx context.Context, id string, hardDelete bool) error {
 	now := time.Now()
 	result := s.db.WithContext(ctx).
 		Model(&model.ServiceTypeInstance{}).
@@ -330,6 +346,7 @@ func (s *ServiceTypeInstanceStore) MarkForDeletion(ctx context.Context, id strin
 			"deletion_requested_at": now,
 			"retry_count":           0,
 			"last_deletion_attempt": nil,
+			"hard_delete":           hardDelete,
 		})
 	if result.Error != nil {
 		return result.Error
@@ -463,7 +480,7 @@ func (s *ServiceTypeInstanceStore) HardDeleteFromAgent(ctx context.Context, id s
 	return err
 }
 
-func (s *ServiceTypeInstanceStore) ResetRetryCount(ctx context.Context, id string) error {
+func (s *ServiceTypeInstanceStore) ResetRetryCount(ctx context.Context, id string, hardDelete bool) error {
 	result := s.db.WithContext(ctx).
 		Model(&model.ServiceTypeInstance{}).
 		Where("id = ?", id).
@@ -471,6 +488,7 @@ func (s *ServiceTypeInstanceStore) ResetRetryCount(ctx context.Context, id strin
 			"deletion_status":       DeletionStatusScheduled,
 			"retry_count":           0,
 			"last_deletion_attempt": nil,
+			"hard_delete":           hardDelete,
 		})
 	if result.Error != nil {
 		return result.Error
@@ -479,6 +497,99 @@ func (s *ServiceTypeInstanceStore) ResetRetryCount(ctx context.Context, id strin
 		return ErrInstanceNotFound
 	}
 	return nil
+}
+
+// lockForUpdate row-locks query on Postgres only: SQLite's driver doesn't
+// support "FOR UPDATE", but its single-writer serialization already gives
+// the same guarantee for tests.
+func lockForUpdate(query *gorm.DB) *gorm.DB {
+	if query.Dialector.Name() == "postgres" {
+		return query.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	return query
+}
+
+// stillPendingDeletion is true for deletion_status SCHEDULED or FAILED
+// (FAILED isn't terminal - a late ack still resolves it), or
+// status=pending_deletion with no deletion_status set yet.
+func stillPendingDeletion(instance *model.ServiceTypeInstance) bool {
+	if instance.Status == model.StatusPendingDeletion {
+		return true
+	}
+	if instance.DeletionStatus == nil {
+		return false
+	}
+	return *instance.DeletionStatus == DeletionStatusScheduled || *instance.DeletionStatus == DeletionStatusFailed
+}
+
+func (s *ServiceTypeInstanceStore) FinalizeDeletionAcknowledged(ctx context.Context, id, agentName string) (finalized, hardDeleted, wasFailed bool, err error) {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var instance model.ServiceTypeInstance
+		query := lockForUpdate(tx.Model(&model.ServiceTypeInstance{}).Where("id = ?", id))
+		if txErr := query.First(&instance).Error; txErr != nil {
+			if errors.Is(txErr, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return txErr
+		}
+		if instance.AgentName == nil || *instance.AgentName != agentName {
+			return nil
+		}
+		if !stillPendingDeletion(&instance) {
+			return nil
+		}
+
+		wasFailed = instance.DeletionStatus != nil && *instance.DeletionStatus == DeletionStatusFailed
+		hardDeleted = instance.HardDelete
+		if hardDeleted {
+			if txErr := tx.Unscoped().Where("id = ? AND agent_name = ?", id, agentName).Delete(&model.ServiceTypeInstance{}).Error; txErr != nil {
+				return txErr
+			}
+		} else {
+			if txErr := tx.Model(&model.ServiceTypeInstance{}).Where("id = ? AND agent_name = ?", id, agentName).Update("deletion_status", DeletionStatusDeleted).Error; txErr != nil {
+				return txErr
+			}
+		}
+		finalized = true
+		return nil
+	})
+	if err != nil {
+		return false, false, false, err
+	}
+	return finalized, hardDeleted, wasFailed, nil
+}
+
+func (s *ServiceTypeInstanceStore) FinalizeAuditGiveUp(ctx context.Context, id string) (finalized, hardDeleted bool, err error) {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var instance model.ServiceTypeInstance
+		query := lockForUpdate(tx.Model(&model.ServiceTypeInstance{}).Where("id = ?", id))
+		if txErr := query.First(&instance).Error; txErr != nil {
+			if errors.Is(txErr, gorm.ErrRecordNotFound) {
+				return nil
+			}
+			return txErr
+		}
+		if instance.DeletionStatus == nil || *instance.DeletionStatus != DeletionStatusScheduled {
+			return nil
+		}
+
+		hardDeleted = instance.HardDelete
+		if hardDeleted {
+			if txErr := tx.Unscoped().Where("id = ?", id).Delete(&model.ServiceTypeInstance{}).Error; txErr != nil {
+				return txErr
+			}
+		} else {
+			if txErr := tx.Model(&model.ServiceTypeInstance{}).Where("id = ?", id).Update("deletion_status", DeletionStatusDeleted).Error; txErr != nil {
+				return txErr
+			}
+		}
+		finalized = true
+		return nil
+	})
+	if err != nil {
+		return false, false, err
+	}
+	return finalized, hardDeleted, nil
 }
 
 // getRetryOptions returns common retry configuration for database operations

@@ -137,8 +137,11 @@ type CreateInstanceParams struct {
 
 // DeleteInstanceParams defines parameters for DeleteInstance.
 type DeleteInstanceParams struct {
-	// Deferred When true, deletion failures are deferred to a cleanup queue
-	// instead of returning an error. Used during rehydration flows.
+	// Deferred When true, the completed deletion keeps a tombstone record
+	// (deletion_status=DELETED, visible via show_deleted=true) instead
+	// of being hard-deleted once the agent acknowledges the deletion
+	// (or once the instance is purged/enrolled immediately, for
+	// instances with no agent to notify).
 	Deferred *bool `form:"deferred,omitempty" json:"deferred,omitempty"`
 }
 

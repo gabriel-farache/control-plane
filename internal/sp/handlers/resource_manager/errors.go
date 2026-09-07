@@ -105,10 +105,6 @@ func handleDeleteInstanceError(err error) server.DeleteInstanceResponseObject {
 			return server.DeleteInstance400ApplicationProblemPlusJSONResponse(newError("validation-error", "Invalid request", svcErr.Message, 400))
 		case service.ErrCodeNotFound:
 			return server.DeleteInstance404ApplicationProblemPlusJSONResponse(newError("not-found", "Instance not found", svcErr.Message, 404))
-		case service.ErrCodeProvisioningError:
-			// A transient, client-actionable failure to publish the delete,
-			// not an internal server bug - map to 422 like CreateInstance.
-			return server.DeleteInstance422ApplicationProblemPlusJSONResponse(newError("provisioning-error", "Provisioning error", svcErr.Message, 422))
 		}
 	}
 	return server.DeleteInstancedefaultApplicationProblemPlusJSONResponse{

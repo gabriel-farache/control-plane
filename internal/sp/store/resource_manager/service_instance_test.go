@@ -646,7 +646,7 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 			instance := newServiceTypeInstance("mark-del", map[string]any{})
 			addInstanceToStore(instance)
 
-			Expect(s.MarkForDeletion(ctx, instance.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, instance.ID, false)).To(Succeed())
 
 			found, err := s.Get(ctx, instance.ID, true)
 			Expect(err).NotTo(HaveOccurred())
@@ -659,14 +659,14 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 			instance := newServiceTypeInstance("mark-hidden", map[string]any{})
 			addInstanceToStore(instance)
 
-			Expect(s.MarkForDeletion(ctx, instance.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, instance.ID, false)).To(Succeed())
 
 			_, err := s.Get(ctx, instance.ID, false)
 			Expect(err).To(MatchError(rmstore.ErrInstanceNotFound))
 		})
 
 		It("returns ErrInstanceNotFound for missing ID", func() {
-			err := s.MarkForDeletion(ctx, uuid.New().String())
+			err := s.MarkForDeletion(ctx, uuid.New().String(), false)
 			Expect(err).To(MatchError(rmstore.ErrInstanceNotFound))
 		})
 	})
@@ -677,8 +677,8 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 			inst2 := addInstanceToStore(newServiceTypeInstance("pending2", map[string]any{}))
 			addInstanceToStore(newServiceTypeInstance("active", map[string]any{}))
 
-			Expect(s.MarkForDeletion(ctx, inst1.ID)).To(Succeed())
-			Expect(s.MarkForDeletion(ctx, inst2.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst1.ID, false)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst2.ID, false)).To(Succeed())
 
 			pending, err := s.ListPendingDeletions(ctx)
 			Expect(err).NotTo(HaveOccurred())
@@ -687,7 +687,7 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 
 		It("excludes FAILED instances", func() {
 			inst := addInstanceToStore(newServiceTypeInstance("failed", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 			Expect(s.MarkDeletionFailed(ctx, inst.ID)).To(Succeed())
 
 			pending, err := s.ListPendingDeletions(ctx)
@@ -697,7 +697,7 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 
 		It("excludes DELETED instances", func() {
 			inst := addInstanceToStore(newServiceTypeInstance("deleted", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 			Expect(s.MarkDeletionComplete(ctx, inst.ID)).To(Succeed())
 
 			pending, err := s.ListPendingDeletions(ctx)
@@ -717,7 +717,7 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 	Describe("IncrementDeletionRetry", func() {
 		It("increments retry count and sets last_deletion_attempt", func() {
 			inst := addInstanceToStore(newServiceTypeInstance("retry-inst", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 
 			Expect(s.IncrementDeletionRetry(ctx, inst.ID)).To(Succeed())
 
@@ -742,7 +742,7 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 	Describe("MarkDeletionFailed", func() {
 		It("sets deletion_status to FAILED", func() {
 			inst := addInstanceToStore(newServiceTypeInstance("fail-inst", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 
 			Expect(s.MarkDeletionFailed(ctx, inst.ID)).To(Succeed())
 
@@ -758,7 +758,7 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 
 		It("does not overwrite DELETED with FAILED", func() {
 			inst := addInstanceToStore(newServiceTypeInstance("fail-after-deleted", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 			Expect(s.MarkDeletionComplete(ctx, inst.ID)).To(Succeed())
 
 			Expect(s.MarkDeletionFailed(ctx, inst.ID)).To(Succeed())
@@ -772,12 +772,12 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 	Describe("ResetRetryCount", func() {
 		It("resets retry count and status to SCHEDULED", func() {
 			inst := addInstanceToStore(newServiceTypeInstance("reset-inst", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 			Expect(s.IncrementDeletionRetry(ctx, inst.ID)).To(Succeed())
 			Expect(s.IncrementDeletionRetry(ctx, inst.ID)).To(Succeed())
 			Expect(s.MarkDeletionFailed(ctx, inst.ID)).To(Succeed())
 
-			Expect(s.ResetRetryCount(ctx, inst.ID)).To(Succeed())
+			Expect(s.ResetRetryCount(ctx, inst.ID, false)).To(Succeed())
 
 			found, err := s.Get(ctx, inst.ID, true)
 			Expect(err).NotTo(HaveOccurred())
@@ -787,15 +787,166 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 		})
 
 		It("returns ErrInstanceNotFound for missing ID", func() {
-			err := s.ResetRetryCount(ctx, uuid.New().String())
+			err := s.ResetRetryCount(ctx, uuid.New().String(), false)
 			Expect(err).To(MatchError(rmstore.ErrInstanceNotFound))
+		})
+	})
+
+	Describe("FinalizeDeletionAcknowledged", func() {
+		agentName := "agent-a"
+
+		It("hard-deletes when still-pending (SCHEDULED) and hard_delete=true and agent_name matches", func() {
+			inst := addInstanceToStore(newServiceTypeInstanceWithAgent("finalize-hard", agentName, map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID, true)).To(Succeed())
+
+			finalized, hardDeleted, wasFailed, err := s.FinalizeDeletionAcknowledged(ctx, inst.ID, agentName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeTrue())
+			Expect(hardDeleted).To(BeTrue())
+			Expect(wasFailed).To(BeFalse())
+
+			_, getErr := s.Get(ctx, inst.ID, true)
+			Expect(getErr).To(MatchError(rmstore.ErrInstanceNotFound))
+		})
+
+		It("soft-completes when still-pending (SCHEDULED) and hard_delete=false", func() {
+			inst := addInstanceToStore(newServiceTypeInstanceWithAgent("finalize-soft", agentName, map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
+
+			finalized, hardDeleted, wasFailed, err := s.FinalizeDeletionAcknowledged(ctx, inst.ID, agentName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeTrue())
+			Expect(hardDeleted).To(BeFalse())
+			Expect(wasFailed).To(BeFalse())
+
+			found, getErr := s.Get(ctx, inst.ID, true)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(*found.DeletionStatus).To(Equal("DELETED"))
+		})
+
+		// REQ-DEL-10: FAILED is still-pending, not terminal.
+		It("finalizes and reports wasFailed=true when the row is FAILED (retries exhausted)", func() {
+			inst := addInstanceToStore(newServiceTypeInstanceWithAgent("finalize-failed", agentName, map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID, true)).To(Succeed())
+			Expect(s.MarkDeletionFailed(ctx, inst.ID)).To(Succeed())
+
+			finalized, hardDeleted, wasFailed, err := s.FinalizeDeletionAcknowledged(ctx, inst.ID, agentName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeTrue())
+			Expect(hardDeleted).To(BeTrue())
+			Expect(wasFailed).To(BeTrue())
+		})
+
+		It("does not finalize when agent_name does not match, row untouched", func() {
+			inst := addInstanceToStore(newServiceTypeInstanceWithAgent("finalize-mismatch", agentName, map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID, true)).To(Succeed())
+
+			finalized, _, _, err := s.FinalizeDeletionAcknowledged(ctx, inst.ID, "agent-b-stale")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeFalse())
+
+			found, getErr := s.Get(ctx, inst.ID, true)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(*found.DeletionStatus).To(Equal("SCHEDULED"))
+		})
+
+		It("does not finalize when the instance is not still-pending (already DELETED)", func() {
+			inst := addInstanceToStore(newServiceTypeInstanceWithAgent("finalize-already-done", agentName, map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
+			Expect(s.MarkDeletionComplete(ctx, inst.ID)).To(Succeed())
+
+			finalized, _, _, err := s.FinalizeDeletionAcknowledged(ctx, inst.ID, agentName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeFalse())
+		})
+
+		It("does not finalize and returns no error for a genuinely missing ID", func() {
+			finalized, _, _, err := s.FinalizeDeletionAcknowledged(ctx, uuid.New().String(), agentName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeFalse())
+		})
+
+		// REQ-DEL-11 AC-1: decision must use the CURRENT hard_delete value.
+		It("resolves according to the current hard_delete value, not a stale one from before a concurrent ResetRetryCount", func() {
+			inst := addInstanceToStore(newServiceTypeInstanceWithAgent("finalize-race", agentName, map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID, true)).To(Succeed())
+
+			// Simulates a concurrent re-delete landing before this finalize call.
+			Expect(s.ResetRetryCount(ctx, inst.ID, false)).To(Succeed())
+
+			finalized, hardDeleted, _, err := s.FinalizeDeletionAcknowledged(ctx, inst.ID, agentName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeTrue())
+			Expect(hardDeleted).To(BeFalse())
+
+			found, getErr := s.Get(ctx, inst.ID, true)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(*found.DeletionStatus).To(Equal("DELETED"))
+		})
+	})
+
+	Describe("FinalizeAuditGiveUp", func() {
+		It("hard-deletes when SCHEDULED and hard_delete=true", func() {
+			inst := addInstanceToStore(newServiceTypeInstance("giveup-hard", map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID, true)).To(Succeed())
+
+			finalized, hardDeleted, err := s.FinalizeAuditGiveUp(ctx, inst.ID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeTrue())
+			Expect(hardDeleted).To(BeTrue())
+
+			_, getErr := s.Get(ctx, inst.ID, true)
+			Expect(getErr).To(MatchError(rmstore.ErrInstanceNotFound))
+		})
+
+		It("soft-completes when SCHEDULED and hard_delete=false", func() {
+			inst := addInstanceToStore(newServiceTypeInstance("giveup-soft", map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
+
+			finalized, hardDeleted, err := s.FinalizeAuditGiveUp(ctx, inst.ID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeTrue())
+			Expect(hardDeleted).To(BeFalse())
+
+			found, getErr := s.Get(ctx, inst.ID, true)
+			Expect(getErr).NotTo(HaveOccurred())
+			Expect(*found.DeletionStatus).To(Equal("DELETED"))
+		})
+
+		It("does not finalize when the instance is no longer SCHEDULED (already FAILED)", func() {
+			inst := addInstanceToStore(newServiceTypeInstance("giveup-failed", map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID, true)).To(Succeed())
+			Expect(s.MarkDeletionFailed(ctx, inst.ID)).To(Succeed())
+
+			finalized, _, err := s.FinalizeAuditGiveUp(ctx, inst.ID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeFalse())
+		})
+
+		It("does not finalize and returns no error for a genuinely missing ID", func() {
+			finalized, _, err := s.FinalizeAuditGiveUp(ctx, uuid.New().String())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeFalse())
+		})
+
+		// REQ-DEL-11 AC-1: same race-freedom proof, no-agent-gate path.
+		It("resolves according to the current hard_delete value, not a stale one from before a concurrent ResetRetryCount", func() {
+			inst := addInstanceToStore(newServiceTypeInstance("giveup-race", map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID, true)).To(Succeed())
+
+			Expect(s.ResetRetryCount(ctx, inst.ID, false)).To(Succeed())
+
+			finalized, hardDeleted, err := s.FinalizeAuditGiveUp(ctx, inst.ID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeTrue())
+			Expect(hardDeleted).To(BeFalse())
 		})
 	})
 
 	Describe("Get with showDeleted", func() {
 		It("returns soft-deleted instance when showDeleted is true", func() {
 			inst := addInstanceToStore(newServiceTypeInstance("soft-del", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 
 			found, err := s.Get(ctx, inst.ID, true)
 			Expect(err).NotTo(HaveOccurred())
@@ -805,7 +956,7 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 
 		It("returns DELETED instance when showDeleted is true", func() {
 			inst := addInstanceToStore(newServiceTypeInstance("soft-del-complete", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 			Expect(s.MarkDeletionComplete(ctx, inst.ID)).To(Succeed())
 
 			found, err := s.Get(ctx, inst.ID, true)
@@ -816,7 +967,7 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 
 		It("returns FAILED instance when showDeleted is true", func() {
 			inst := addInstanceToStore(newServiceTypeInstance("soft-del-failed", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 			Expect(s.MarkDeletionFailed(ctx, inst.ID)).To(Succeed())
 
 			found, err := s.Get(ctx, inst.ID, true)
@@ -827,7 +978,7 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 
 		It("returns not found for soft-deleted instance when showDeleted is false", func() {
 			inst := addInstanceToStore(newServiceTypeInstance("soft-del2", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 
 			_, err := s.Get(ctx, inst.ID, false)
 			Expect(err).To(MatchError(rmstore.ErrInstanceNotFound))
@@ -838,7 +989,7 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 		It("excludes soft-deleted instances by default", func() {
 			addInstanceToStore(newServiceTypeInstance("active", map[string]any{}))
 			deleted := addInstanceToStore(newServiceTypeInstance("deleted", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, deleted.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, deleted.ID, false)).To(Succeed())
 
 			result, err := s.List(ctx, &rmstore.ServiceTypeInstanceListOptions{})
 			Expect(err).NotTo(HaveOccurred())
@@ -848,7 +999,7 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 		It("includes soft-deleted instances when ShowDeleted is true", func() {
 			addInstanceToStore(newServiceTypeInstance("active", map[string]any{}))
 			deleted := addInstanceToStore(newServiceTypeInstance("deleted", map[string]any{}))
-			Expect(s.MarkForDeletion(ctx, deleted.ID)).To(Succeed())
+			Expect(s.MarkForDeletion(ctx, deleted.ID, false)).To(Succeed())
 
 			result, err := s.List(ctx, &rmstore.ServiceTypeInstanceListOptions{ShowDeleted: true})
 			Expect(err).NotTo(HaveOccurred())

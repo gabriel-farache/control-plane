@@ -593,7 +593,6 @@ type DeleteInstanceResponse struct {
 	JSON401                       *Unauthorized
 	JSON403                       *Forbidden
 	ApplicationproblemJSON404     *Error
-	ApplicationproblemJSON422     *Error
 	ApplicationproblemJSONDefault *Error
 }
 
@@ -877,13 +876,6 @@ func ParseDeleteInstanceResponse(rsp *http.Response) (*DeleteInstanceResponse, e
 			return nil, err
 		}
 		response.ApplicationproblemJSON404 = &dest
-
-	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
-		var dest Error
-		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
-			return nil, err
-		}
-		response.ApplicationproblemJSON422 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
 		var dest Error

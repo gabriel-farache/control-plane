@@ -211,16 +211,36 @@ paths:
       summary: Delete an instance
       operationId: deleteInstance
       description: |
-        Remove an instance. When `deferred` is true, deletion failures are
-        recorded in a cleanup queue and the request returns success. This is
-        used during rehydration flows to avoid blocking on provider errors.
+        Remove an instance. Behavior depends on whether there is an agent to
+        notify:
+
+        - Agent-routed instances (agent_name set, and a message publisher
+          configured): the instance is enrolled for deletion
+          (deletion_status=SCHEDULED) and a deletion request is published to
+          the agent, best-effort; the call returns 204 once enrollment
+          succeeds, regardless of whether the publish succeeded — a publish
+          failure is retried later by the cleanup scheduler and is never
+          surfaced to the caller. `deferred` does not change whether the
+          delete is published or retried; it only controls whether the
+          completed deletion (once the agent acknowledges it, or the agent
+          is found to no longer exist) keeps a visible tombstone or is fully
+          purged.
+        - Instances with no agent to notify (no agent_name, or no publisher
+          configured): with `deferred=false` (the default), the instance is
+          hard-deleted immediately and is never enrolled. With
+          `deferred=true`, the instance is enrolled
+          (deletion_status=SCHEDULED) and later marked complete by the
+          cleanup scheduler's next cycle — not immediately.
       parameters:
         - $ref: '#/components/parameters/InstanceIdPath'
         - name: deferred
           in: query
           description: |
-            When true, deletion failures are deferred to a cleanup queue
-            instead of returning an error. Used during rehydration flows.
+            When true, the completed deletion keeps a tombstone record
+            (deletion_status=DELETED, visible via show_deleted=true) instead
+            of being hard-deleted once the agent acknowledges the deletion
+            (or once the instance is purged/enrolled immediately, for
+            instances with no agent to notify).
           schema:
             type: boolean
             default: false
@@ -239,12 +259,6 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           description: Instance not found
-          content:
-            application/problem+json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '422':
-          description: Provisioning error - failed to publish the delete request to the agent
           content:
             application/problem+json:
               schema:

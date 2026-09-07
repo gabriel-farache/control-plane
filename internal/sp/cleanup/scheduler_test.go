@@ -11,6 +11,7 @@ import (
 	"github.com/dcm-project/control-plane/internal/sp/messaging"
 	"github.com/dcm-project/control-plane/internal/sp/store"
 	"github.com/dcm-project/control-plane/internal/sp/store/model"
+	rmstore "github.com/dcm-project/control-plane/internal/sp/store/resource_manager"
 	"github.com/dcm-project/control-plane/internal/sp/testutil"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go/jetstream"
@@ -83,7 +84,7 @@ var _ = Describe("Scheduler", func() {
 				AgentName:    &agentName,
 			}
 			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
-			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 
 			scheduler.ProcessPendingDeletions(ctx)
 
@@ -103,13 +104,32 @@ var _ = Describe("Scheduler", func() {
 				AgentName:    &agentName,
 			}
 			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
-			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 
 			scheduler.ProcessPendingDeletions(ctx)
 
 			found, err := dataStore.ServiceTypeInstance().Get(ctx, inst.ID, true)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(*found.DeletionStatus).To(Equal("DELETED"))
+		})
+
+		It("hard-deletes (purges) when agent not registered and the instance was enrolled HardDelete=true", func() {
+			agentName := "unregistered-agent"
+			inst := model.ServiceTypeInstance{
+				ID:           uuid.New().String(),
+				ServiceType:  "vm",
+				Status:       "deleting",
+				InstanceName: "orphan-hard-delete-inst",
+				Spec:         map[string]any{"cpu": 1},
+				AgentName:    &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, true)).To(Succeed())
+
+			scheduler.ProcessPendingDeletions(ctx)
+
+			_, err := dataStore.ServiceTypeInstance().Get(ctx, inst.ID, true)
+			Expect(err).To(MatchError(rmstore.ErrInstanceNotFound))
 		})
 
 		It("marks DELETED for agent-routed instance regardless of service_type", func() {
@@ -123,7 +143,7 @@ var _ = Describe("Scheduler", func() {
 				AgentName:    &agentName,
 			}
 			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
-			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 
 			scheduler.ProcessPendingDeletions(ctx)
 
@@ -141,7 +161,7 @@ var _ = Describe("Scheduler", func() {
 				Spec:         map[string]any{"cpu": 1},
 			}
 			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
-			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 
 			scheduler.ProcessPendingDeletions(ctx)
 
@@ -166,7 +186,7 @@ var _ = Describe("Scheduler", func() {
 				AgentName:    &agentName,
 			}
 			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
-			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 
 			schedulerWithAgent.ProcessPendingDeletions(ctx)
 
@@ -174,6 +194,34 @@ var _ = Describe("Scheduler", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(*found.DeletionStatus).To(Equal("SCHEDULED"))
 			Expect(found.RetryCount).To(Equal(1))
+		})
+
+		// TC-DEL-13 (REQ-DEL-11): must resolve according to the CURRENT
+		// hard_delete value at finalize time, not a stale snapshot.
+		It("resolves according to the current hard_delete value, not a snapshot changed by a concurrent re-delete (atomic finalize)", func() {
+			agentName := "unregistered-agent"
+			inst := model.ServiceTypeInstance{
+				ID:           uuid.New().String(),
+				ServiceType:  "vm",
+				Status:       "deleting",
+				InstanceName: "race-inst",
+				Spec:         map[string]any{"cpu": 1},
+				AgentName:    &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, true)).To(Succeed())
+
+			// Simulates a concurrent re-delete to deferred mode before finalize runs.
+			Expect(dataStore.ServiceTypeInstance().ResetRetryCount(ctx, inst.ID, false)).To(Succeed())
+
+			finalized, hardDeleted, err := dataStore.ServiceTypeInstance().FinalizeAuditGiveUp(ctx, inst.ID)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeTrue())
+			Expect(hardDeleted).To(BeFalse())
+
+			found, err := dataStore.ServiceTypeInstance().Get(ctx, inst.ID, true)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(*found.DeletionStatus).To(Equal("DELETED"))
 		})
 
 		It("marks FAILED for manual intervention once retries are exhausted", func() {
@@ -191,7 +239,7 @@ var _ = Describe("Scheduler", func() {
 				RetryCount:   2,
 			}
 			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
-			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			Expect(dataStore.ServiceTypeInstance().MarkForDeletion(ctx, inst.ID, false)).To(Succeed())
 			// MarkForDeletion resets retry_count; simulate prior attempts explicitly.
 			Expect(db.Model(&inst).Update("retry_count", 2).Error).NotTo(HaveOccurred())
 

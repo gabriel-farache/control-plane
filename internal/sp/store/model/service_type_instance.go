@@ -39,6 +39,11 @@ type ServiceTypeInstance struct {
 	RetryCount          int        `gorm:"column:retry_count;default:0"`
 	LastDeletionAttempt *time.Time `gorm:"column:last_deletion_attempt"`
 	DeletionRequestedAt *time.Time `gorm:"column:deletion_requested_at"`
+
+	// HardDelete records the deletion mode at enrollment time (true =
+	// purge on ack, false = tombstone), so ack/scheduler handling never
+	// depends on the racy post-publish status=deleting write.
+	HardDelete bool `gorm:"column:hard_delete;not null;default:false"`
 }
 
 type ServiceTypeInstanceList []ServiceTypeInstance

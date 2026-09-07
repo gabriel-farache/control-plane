@@ -282,7 +282,49 @@ var _ = Describe("ResponseConsumer", func() {
 
 	It("hard-deletes a non-deferred instance on deletion-acknowledged", func() {
 		instance := createPendingInstance(ctx, db)
-		Expect(db.Model(&instance).Update("status", "deleting").Error).NotTo(HaveOccurred())
+		Expect(db.Model(&instance).Updates(map[string]any{
+			"deletion_status": "SCHEDULED",
+			"hard_delete":     true,
+		}).Error).NotTo(HaveOccurred())
+
+		Expect(rc.Start(ctx)).To(Succeed())
+
+		publishAgentEvent(js, "dcm.agent.deletion-acknowledged", instance.ID, testAgentName)
+
+		Eventually(func() error {
+			return db.First(&model.ServiceTypeInstance{}, "id = ?", instance.ID).Error
+		}, 2*time.Second, 100*time.Millisecond).Should(MatchError(gorm.ErrRecordNotFound))
+	})
+
+	// A "fast ack" arriving before status is ever set to deleting must
+	// still hard-delete, not soft-complete into a tombstone.
+	It("hard-deletes on a fast ack that arrives before status is ever set to deleting", func() {
+		instance := createPendingInstance(ctx, db)
+		Expect(db.Model(&instance).Updates(map[string]any{
+			"deletion_status": "SCHEDULED",
+			"hard_delete":     true,
+		}).Error).NotTo(HaveOccurred())
+		Expect(currentStatus(db, instance.ID)).To(Equal("pending"))
+
+		Expect(rc.Start(ctx)).To(Succeed())
+
+		publishAgentEvent(js, "dcm.agent.deletion-acknowledged", instance.ID, testAgentName)
+
+		Eventually(func() error {
+			return db.First(&model.ServiceTypeInstance{}, "id = ?", instance.ID).Error
+		}, 2*time.Second, 100*time.Millisecond).Should(MatchError(gorm.ErrRecordNotFound))
+	})
+
+	// Scheduler retries never set status=deleting either; the ack must
+	// still hard-delete once it finally arrives.
+	It("hard-deletes after simulated publish-failure retries, still without status ever set to deleting", func() {
+		instance := createPendingInstance(ctx, db)
+		Expect(db.Model(&instance).Updates(map[string]any{
+			"deletion_status": "SCHEDULED",
+			"hard_delete":     true,
+			"retry_count":     3,
+		}).Error).NotTo(HaveOccurred())
+		Expect(currentStatus(db, instance.ID)).To(Equal("pending"))
 
 		Expect(rc.Start(ctx)).To(Succeed())
 
@@ -311,7 +353,10 @@ var _ = Describe("ResponseConsumer", func() {
 		)
 
 		instance := createPendingInstance(ctx, db)
-		Expect(db.Model(&instance).Update("status", "deleting").Error).NotTo(HaveOccurred())
+		Expect(db.Model(&instance).Updates(map[string]any{
+			"deletion_status": "SCHEDULED",
+			"hard_delete":     true,
+		}).Error).NotTo(HaveOccurred())
 
 		Expect(rc.Start(ctx)).To(Succeed())
 		publishAgentEvent(js, "dcm.agent.deletion-acknowledged", instance.ID, testAgentName)
@@ -322,7 +367,10 @@ var _ = Describe("ResponseConsumer", func() {
 
 	It("logs the hard-delete with event_type on a successful deletion-acknowledged (non-deferred)", func() {
 		instance := createPendingInstance(ctx, db)
-		Expect(db.Model(&instance).Update("status", "deleting").Error).NotTo(HaveOccurred())
+		Expect(db.Model(&instance).Updates(map[string]any{
+			"deletion_status": "SCHEDULED",
+			"hard_delete":     true,
+		}).Error).NotTo(HaveOccurred())
 
 		var buf syncBuffer
 		prevLogger := slog.Default()
@@ -346,7 +394,10 @@ var _ = Describe("ResponseConsumer", func() {
 	// hard-delete the row, for the non-deferred branch.
 	It("ignores a deletion-acknowledged (non-deferred branch) from a superseded agent", func() {
 		instance := createPendingInstance(ctx, db)
-		Expect(db.Model(&instance).Update("status", "deleting").Error).NotTo(HaveOccurred())
+		Expect(db.Model(&instance).Updates(map[string]any{
+			"deletion_status": "SCHEDULED",
+			"hard_delete":     true,
+		}).Error).NotTo(HaveOccurred())
 
 		Expect(rc.Start(ctx)).To(Succeed())
 
@@ -479,7 +530,26 @@ var _ = Describe("ResponseConsumer", func() {
 		}, 300*time.Millisecond, 20*time.Millisecond).Should(Equal("DELETED"))
 	})
 
-	It("ignores a late/duplicate deletion-acknowledged instead of erasing an existing FAILED audit record (A)", func() {
+	// TC-DEL-08 (REQ-DEL-10): a late ack from the assigned agent for a
+	// FAILED row still hard-deletes it.
+	It("hard-deletes a FAILED (retries-exhausted) instance on a late deletion-acknowledged from the assigned agent", func() {
+		instance := createPendingInstance(ctx, db)
+		Expect(db.Model(&instance).Updates(map[string]any{
+			"deletion_status": "FAILED",
+			"hard_delete":     true,
+		}).Error).NotTo(HaveOccurred())
+
+		Expect(rc.Start(ctx)).To(Succeed())
+
+		publishAgentEvent(js, "dcm.agent.deletion-acknowledged", instance.ID, testAgentName)
+
+		Eventually(func() error {
+			return db.First(&model.ServiceTypeInstance{}, "id = ?", instance.ID).Error
+		}, 2*time.Second, 100*time.Millisecond).Should(MatchError(gorm.ErrRecordNotFound))
+	})
+
+	// TC-DEL-09 (REQ-DEL-10): same, but hard_delete=false soft-completes to a tombstone.
+	It("soft-completes a FAILED (retries-exhausted) instance on a late deletion-acknowledged from the assigned agent", func() {
 		instance := createPendingInstance(ctx, db)
 		Expect(db.Model(&instance).Update("deletion_status", "FAILED").Error).NotTo(HaveOccurred())
 
@@ -487,14 +557,89 @@ var _ = Describe("ResponseConsumer", func() {
 
 		publishAgentEvent(js, "dcm.agent.deletion-acknowledged", instance.ID, testAgentName)
 
-		Consistently(func() string {
+		Eventually(func() string {
 			var updated model.ServiceTypeInstance
-			Expect(db.First(&updated, "id = ?", instance.ID).Error).NotTo(HaveOccurred())
+			if err := db.First(&updated, "id = ?", instance.ID).Error; err != nil {
+				return ""
+			}
 			if updated.DeletionStatus == nil {
 				return ""
 			}
 			return *updated.DeletionStatus
-		}, 300*time.Millisecond, 20*time.Millisecond).Should(Equal("FAILED"))
+		}, 2*time.Second, 100*time.Millisecond).Should(Equal("DELETED"))
+
+		Expect(db.First(&model.ServiceTypeInstance{}, "id = ?", instance.ID).Error).NotTo(HaveOccurred())
+	})
+
+	// TC-DEL-10 (REQ-DEL-10 AC-2): a FAILED row's ack from a superseded agent is still ignored.
+	It("ignores a deletion-acknowledged for a FAILED instance from a superseded agent", func() {
+		instance := createPendingInstance(ctx, db)
+		Expect(db.Model(&instance).Updates(map[string]any{
+			"deletion_status": "FAILED",
+			"hard_delete":     true,
+		}).Error).NotTo(HaveOccurred())
+
+		Expect(rc.Start(ctx)).To(Succeed())
+
+		publishAgentEvent(js, "dcm.agent.deletion-acknowledged", instance.ID, staleAgentName)
+
+		Consistently(func() error {
+			return db.First(&model.ServiceTypeInstance{}, "id = ?", instance.ID).Error
+		}, 300*time.Millisecond, 20*time.Millisecond).Should(Succeed())
+	})
+
+	// TC-DEL-11 (REQ-DEL-10 AC-3): finalizing a FAILED row via a late ack logs a distinct Warn.
+	It("logs a distinct Warn line when finalizing a FAILED instance via a late ack", func() {
+		instance := createPendingInstance(ctx, db)
+		Expect(db.Model(&instance).Updates(map[string]any{
+			"deletion_status": "FAILED",
+			"hard_delete":     true,
+		}).Error).NotTo(HaveOccurred())
+
+		var buf syncBuffer
+		prevLogger := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+		defer slog.SetDefault(prevLogger)
+
+		Expect(rc.Start(ctx)).To(Succeed())
+
+		publishAgentEvent(js, "dcm.agent.deletion-acknowledged", instance.ID, testAgentName)
+
+		Eventually(buf.String, 2*time.Second, 20*time.Millisecond).Should(SatisfyAll(
+			ContainSubstring("already given up (FAILED), finalizing anyway"),
+			ContainSubstring("instance_id="+instance.ID),
+			ContainSubstring("agent_name="+testAgentName),
+		))
+	})
+
+	// TC-DEL-12 (REQ-DEL-11): must act on the CURRENT hard_delete value, not
+	// one read before a concurrent re-delete (ResetRetryCount) changed it.
+	It("resolves according to the current hard_delete value, not one changed by a concurrent re-delete after the original enrollment", func() {
+		instance := createPendingInstance(ctx, db)
+		Expect(db.Model(&instance).Updates(map[string]any{
+			"deletion_status": "SCHEDULED",
+			"hard_delete":     true,
+		}).Error).NotTo(HaveOccurred())
+
+		// Simulates a concurrent re-delete to deferred mode landing before the ack is processed.
+		Expect(dataStore.ServiceTypeInstance().ResetRetryCount(ctx, instance.ID, false)).To(Succeed())
+
+		Expect(rc.Start(ctx)).To(Succeed())
+
+		publishAgentEvent(js, "dcm.agent.deletion-acknowledged", instance.ID, testAgentName)
+
+		// Must soft-complete (tombstone), not hard-delete.
+		Eventually(func() string {
+			var updated model.ServiceTypeInstance
+			if err := db.First(&updated, "id = ?", instance.ID).Error; err != nil {
+				return ""
+			}
+			if updated.DeletionStatus == nil {
+				return ""
+			}
+			return *updated.DeletionStatus
+		}, 2*time.Second, 100*time.Millisecond).Should(Equal("DELETED"))
+		Expect(db.First(&model.ServiceTypeInstance{}, "id = ?", instance.ID).Error).NotTo(HaveOccurred())
 	})
 
 	It("publishes deletion on cancel-rejected and enrolls it in cleanup retry tracking", func() {

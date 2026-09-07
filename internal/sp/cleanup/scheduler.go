@@ -105,8 +105,9 @@ func (s *Scheduler) processOne(ctx context.Context, instance model.ServiceTypeIn
 	log := logging.FromContext(ctx)
 
 	if instance.AgentName == nil {
-		// Never agent-routed: there is no physical resource on an agent to
-		// wait for, so this is a normal (non-audited) completion.
+		// Never agent-routed: no physical resource to wait for, so this is
+		// a normal completion. Always a tombstone: a non-deferred no-agent
+		// delete resolves immediately in DeleteInstance and never reaches here.
 		log.Info("cleanup: no agent, marking DELETED", "instance_id", instance.ID)
 		if err := s.store.ServiceTypeInstance().MarkDeletionComplete(ctx, instance.ID); err != nil {
 			log.Error("Failed to mark instance as DELETED", "instance_id", instance.ID, "error", err)
@@ -156,16 +157,31 @@ func (s *Scheduler) processOne(ctx context.Context, instance model.ServiceTypeIn
 	}
 }
 
-// auditGiveUp marks an instance DELETED without ever confirming the physical
+// auditGiveUp resolves an instance without ever confirming the physical
 // resource was removed, because the CP has lost its only path to ask the
-// agent (agent deregistered, or no NATS/agent store wired up). This is
-// intentionally logged at Warn with a structured reason so operators can
-// find instances whose backing resource may be orphaned (REQ-CLEANUP-AUDIT).
+// agent (agent deregistered, or no NATS/agent store wired up). Delegates to
+// FinalizeAuditGiveUp, which re-reads and acts on state atomically instead
+// of the possibly-stale `instance` snapshot from ListPendingDeletions.
+// Logged at Warn with a structured reason so operators can find instances
+// whose backing resource may be orphaned (REQ-CLEANUP-AUDIT).
 func (s *Scheduler) auditGiveUp(ctx context.Context, instance model.ServiceTypeInstance, reason string) {
 	log := logging.FromContext(ctx)
+	finalized, hardDeleted, err := s.store.ServiceTypeInstance().FinalizeAuditGiveUp(ctx, instance.ID)
+	if err != nil {
+		log.Error("Failed to finalize audit give-up", "instance_id", instance.ID, "error", err)
+		return
+	}
+	if !finalized {
+		// Raced with a concurrent finalize (ack arrived, or another cycle already gave up).
+		log.Info("cleanup audit: instance no longer pending deletion, skipping give-up",
+			"instance_id", instance.ID, "agent_name", *instance.AgentName, "reason", reason)
+		return
+	}
+	if hardDeleted {
+		log.Warn("cleanup audit: hard-deleting without confirmed physical deletion",
+			"instance_id", instance.ID, "agent_name", *instance.AgentName, "reason", reason)
+		return
+	}
 	log.Warn("cleanup audit: marking DELETED without confirmed physical deletion",
 		"instance_id", instance.ID, "agent_name", *instance.AgentName, "reason", reason)
-	if err := s.store.ServiceTypeInstance().MarkDeletionComplete(ctx, instance.ID); err != nil {
-		log.Error("Failed to mark instance as DELETED", "instance_id", instance.ID, "error", err)
-	}
 }

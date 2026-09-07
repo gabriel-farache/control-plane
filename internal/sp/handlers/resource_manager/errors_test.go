@@ -8,15 +8,18 @@ import (
 )
 
 var _ = Describe("handleDeleteInstanceError", func() {
-	It("maps a ProvisioningError to 422 instead of the generic 500 default (R2 S7: finding #1)", func() {
-		// DeleteInstance's non-deferred path returns this when publishing
-		// the delete to the agent fails: a transient, client-actionable
-		// failure to carry out the delete, not an internal server bug.
+	It("no longer has a dedicated 422 branch: a ProvisioningError falls to the generic 500 default (REQ-DEL-02)", func() {
+		// DeleteInstance no longer returns ProvisioningError for a publish
+		// failure (that's now retried by the cleanup scheduler instead of
+		// failing the API call), so handleDeleteInstanceError has nothing
+		// mapping ErrCodeProvisioningError to 422 anymore; any caller that
+		// still passes one through falls to the same default as any other
+		// unrecognized code.
 		resp := handleDeleteInstanceError(service.NewProvisioningError("failed to publish delete for instance x: nats unavailable"))
 
-		typedResp, ok := resp.(server.DeleteInstance422ApplicationProblemPlusJSONResponse)
+		defResp, ok := resp.(server.DeleteInstancedefaultApplicationProblemPlusJSONResponse)
 		Expect(ok).To(BeTrue())
-		Expect(typedResp.Type).To(Equal("provisioning-error"))
+		Expect(defResp.StatusCode).To(Equal(500))
 	})
 
 	It("still maps unrecognized errors to the generic 500 default", func() {
