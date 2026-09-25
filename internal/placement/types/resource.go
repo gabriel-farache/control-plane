@@ -18,6 +18,19 @@ type CreateRunRequest struct {
 	Resources             []ResourceInput `json:"resources"`
 }
 
+// AgentErrorDetails is the structured error reported by an agent.
+type AgentErrorDetails struct {
+	Error         string              `json:"error,omitempty"`
+	Message       string              `json:"message,omitempty"`
+	ProviderError *AgentProviderError `json:"provider_error,omitempty"`
+}
+
+// AgentProviderError contains provider failure information.
+type AgentProviderError struct {
+	StatusCode *int   `json:"status_code,omitempty"`
+	Message    string `json:"message,omitempty"`
+}
+
 // Resource is a placement resource row within a run.
 type Resource struct {
 	AgentName             *string        `json:"agent_name,omitempty"`

@@ -141,6 +141,7 @@ func Run() int {
 			cfg.Agent.ResponseMaxDeliver,
 			cfg.Agent.ResponseAckWait,
 			spconsumer.SetPlacementDeletionHandler(placementService.OnResourceDeleted),
+			spconsumer.SetPlacementAgentErrorHandler(placementService.OnAgentError),
 		)
 		if err := responseConsumer.Start(ctx); err != nil {
 			slog.Error("Failed to start agent response consumer", "error", err)

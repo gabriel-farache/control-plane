@@ -235,8 +235,12 @@ func (s *PlacementService) ListRun(ctx context.Context, opts *store.ResourceList
 
 // DeleteRun starts deletion for a run by run_id.
 func (s *PlacementService) DeleteRun(ctx context.Context, runID string) error {
+	return s.beginRunDeletion(ctx, runID, store.CleanupIntentExplicit)
+}
+
+func (s *PlacementService) beginRunDeletion(ctx context.Context, runID string, intent store.CleanupIntent) error {
 	log := logging.FromContext(ctx)
-	log.Debug("Deleting run", "run_id", runID)
+	log.Debug("Deleting run", "run_id", runID, "cleanup_intent", intent)
 
 	resources, err := s.store.Resource().ListByRunID(ctx, runID)
 	if err != nil {
@@ -247,10 +251,12 @@ func (s *PlacementService) DeleteRun(ctx context.Context, runID string) error {
 		return NewNotFoundError(fmt.Sprintf("run %s not found", runID))
 	}
 
-	// Mark all resources in the run as PENDING_DELETION
-	if err := s.store.Resource().UpdateStatusByRunID(ctx, runID, types.ResourceStatusPendingDeletion); err != nil {
-		log.Error("Failed to mark resources as pending deletion", "run_id", runID, "error", err)
-		return NewInternalError(fmt.Sprintf("failed to mark run %s as pending deletion: %v", runID, err))
+	if err := s.store.Resource().PrepareRunDeletion(ctx, runID, intent); err != nil {
+		if errors.Is(err, store.ErrResourceNotFound) {
+			return NewNotFoundError(fmt.Sprintf("run %s not found", runID))
+		}
+		log.Error("Failed to mark resources for deletion", "run_id", runID, "error", err)
+		return NewInternalError(fmt.Sprintf("failed to mark run %s for deletion: %v", runID, err))
 	}
 
 	return s.progressRunDeletion(ctx, runID)

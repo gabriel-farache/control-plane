@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/dcm-project/control-plane/internal/placement/store/model"
+	"github.com/dcm-project/control-plane/internal/placement/types"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -13,6 +15,13 @@ import (
 var (
 	ErrResourceNotFound = errors.New("resource not found")
 	ErrResourceIdExist  = errors.New("resource with id already exists")
+)
+
+type CleanupIntent string
+
+const (
+	CleanupIntentRollback CleanupIntent = "ROLLBACK"
+	CleanupIntentExplicit CleanupIntent = "EXPLICIT_DELETE"
 )
 
 // ResourceListOptions contains optional fields for listing runs.
@@ -44,7 +53,9 @@ type Resource interface { //nolint:interfacebloat
 	// status is one of fromStatuses. Returns whether the update applied.
 	UpdateStatusFrom(ctx context.Context, id string, fromStatuses []string, toStatus string) (bool, error)
 	UpdateStatusByRunID(ctx context.Context, runID, status string) error
+	PrepareRunDeletion(ctx context.Context, runID string, intent CleanupIntent) error
 	UpdateAgentName(ctx context.Context, id string, agentName string) error
+	UpdateAgentError(ctx context.Context, id, agentName string, streamSequence uint64, details types.AgentErrorDetails) (bool, error)
 	UpdatePlacementDecision(ctx context.Context, id, agentName, approval string) error
 }
 
@@ -241,6 +252,29 @@ func (s *ResourceStore) UpdateStatusByRunID(ctx context.Context, runID, status s
 	return nil
 }
 
+// PrepareRunDeletion atomically records cleanup intent and schedules pending rows.
+func (s *ResourceStore) PrepareRunDeletion(ctx context.Context, runID string, intent CleanupIntent) error {
+	if intent != CleanupIntentRollback && intent != CleanupIntentExplicit {
+		return fmt.Errorf("invalid cleanup intent %q", intent)
+	}
+	result := s.db.WithContext(ctx).Model(&model.Resource{}).
+		Where("run_id = ?", runID).
+		Updates(map[string]any{
+			"status": gorm.Expr("CASE WHEN status IN (?, ?) THEN status ELSE ? END",
+				types.ResourceStatusDeleting, types.ResourceStatusDeleted, types.ResourceStatusPendingDeletion),
+			"cleanup_intent": gorm.Expr("CASE WHEN ? = ? THEN ? WHEN cleanup_intent = ? THEN ? ELSE ? END",
+				intent, CleanupIntentExplicit, CleanupIntentExplicit,
+				CleanupIntentExplicit, CleanupIntentExplicit, CleanupIntentRollback),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ErrResourceNotFound
+	}
+	return nil
+}
+
 // UpdateAgentName updates the agent_name column for observability after the
 // self-healing loop re-routes a resource to a different agent.
 func (s *ResourceStore) UpdateAgentName(ctx context.Context, id string, agentName string) error {
@@ -252,6 +286,30 @@ func (s *ResourceStore) UpdateAgentName(ctx context.Context, id string, agentNam
 		return ErrResourceNotFound
 	}
 	return nil
+}
+
+// UpdateAgentError stores the newest assigned-agent error and accepts equal-sequence retries.
+func (s *ResourceStore) UpdateAgentError(ctx context.Context, id, agentName string, streamSequence uint64, details types.AgentErrorDetails) (bool, error) {
+	result := s.db.WithContext(ctx).Model(&model.Resource{}).Where(
+		"id = ? AND agent_name = ? AND agent_error_stream_sequence < ?",
+		id, agentName, streamSequence,
+	).Select("AgentErrorDetails", "AgentErrorStreamSequence").Updates(model.Resource{
+		AgentErrorDetails:        &details,
+		AgentErrorStreamSequence: streamSequence,
+	})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	if result.RowsAffected > 0 {
+		return true, nil
+	}
+
+	var count int64
+	err := s.db.WithContext(ctx).Model(&model.Resource{}).Where(
+		"id = ? AND agent_name = ? AND agent_error_stream_sequence = ?",
+		id, agentName, streamSequence,
+	).Count(&count).Error
+	return count > 0, err
 }
 
 func (s *ResourceStore) UpdatePlacementDecision(ctx context.Context, id, agentName, approval string) error {

@@ -285,9 +285,9 @@ func (s *InstanceService) ListInstances(ctx context.Context, serviceType, agentN
 	}, nil
 }
 
-// DeleteInstance removes an instance. Deferred: marks for background cleanup
-// and swallows publish failures for the cleanup scheduler to retry.
-// Non-deferred: publish failures return an error to the caller immediately.
+// DeleteInstance removes an instance. Deferred requests mark for background
+// cleanup and rely on the cleanup scheduler after publish failures. Non-deferred
+// agent deletes persist their status and cleanup enrollment before publishing.
 // In both cases, an agent-routed instance is only purged once the agent's
 // "deletion-acknowledged" event confirms the physical resource is gone (see
 // consumer.ResponseConsumer). A non-deferred delete is therefore also
@@ -307,6 +307,10 @@ func (s *InstanceService) DeleteInstance(ctx context.Context, instanceID string,
 	}
 
 	if deferred {
+		if instance.DeletionStatus != nil && *instance.DeletionStatus == rmstore.DeletionStatusScheduled {
+			log.Debug("Delete is already scheduled; cleanup worker owns retries", "instance_id", instanceID)
+			return nil
+		}
 		if instance.DeletionStatus != nil {
 			if resetErr := s.store.ServiceTypeInstance().ResetRetryCount(ctx, instanceID); resetErr != nil {
 				log.Error("Failed to reset retry count", "instance_id", instanceID, "error", resetErr)
@@ -315,6 +319,15 @@ func (s *InstanceService) DeleteInstance(ctx context.Context, instanceID string,
 			if markErr := s.store.ServiceTypeInstance().MarkForDeletion(ctx, instanceID); markErr != nil {
 				return service.NewInternalError(fmt.Sprintf("failed to mark instance %s for deletion: %v", instanceID, markErr))
 			}
+		}
+
+		claimed, claimErr := s.store.ServiceTypeInstance().ClaimDeletionAttempt(ctx, instanceID, nil)
+		if claimErr != nil {
+			return service.NewInternalError(fmt.Sprintf("failed to claim deletion attempt for instance %s: %v", instanceID, claimErr))
+		}
+		if !claimed {
+			log.Debug("Cleanup scheduler already claimed delete publication", "instance_id", instanceID)
+			return nil
 		}
 
 		if err := s.publishDeleteToAgent(ctx, instance); err != nil {
@@ -336,12 +349,11 @@ func (s *InstanceService) DeleteInstance(ctx context.Context, instanceID string,
 		return nil
 	}
 
-	if err := s.publishDeleteToAgent(ctx, instance); err != nil {
+	// Resolve the agent before persisting deletion state so a missing agent
+	// retains its existing hard-delete behavior.
+	subject, err := s.resolveAgentSubject(ctx, *instance.AgentName)
+	if err != nil {
 		if errors.Is(err, agentstore.ErrAgentNotFound) {
-			// The agent is gone, so no "deletion-acknowledged" will ever
-			// arrive: purge now instead of stranding the instance in
-			// "deleting" forever, matching the cleanup scheduler's own
-			// audit-giveup behavior for the deferred path.
 			log.Warn("Agent not found for non-deferred delete, deleting locally without confirmation",
 				"instance_id", instanceID, "agent_name", *instance.AgentName)
 			if hardErr := s.store.ServiceTypeInstance().HardDelete(ctx, instanceID); hardErr != nil {
@@ -349,21 +361,42 @@ func (s *InstanceService) DeleteInstance(ctx context.Context, instanceID string,
 			}
 			return nil
 		}
-		log.Error("Failed to publish delete to agent", "instance_id", instanceID, "error", err)
+		log.Error("Failed to resolve agent topic for delete", "instance_id", instanceID, "error", err)
 		return service.NewProvisioningError(fmt.Sprintf("failed to publish delete for instance %s: %v", instanceID, err))
+	}
+
+	if instance.Status == model.StatusDeleting && instance.DeletionStatus != nil && *instance.DeletionStatus == rmstore.DeletionStatusScheduled {
+		log.Debug("Delete is already scheduled; cleanup worker owns retries", "instance_id", instanceID)
+		return nil
 	}
 
 	if err := s.store.ServiceTypeInstance().UpdateStatus(ctx, instanceID, model.StatusDeleting, "", nil); err != nil {
 		log.Error("Failed to mark instance deleting", "instance_id", instanceID, "error", err)
 		return service.NewInternalError(fmt.Sprintf("failed to update instance %s: %v", instanceID, err))
 	}
-
 	if err := s.store.ServiceTypeInstance().MarkForDeletion(ctx, instanceID); err != nil {
-		// Best-effort: the instance is already "deleting" and a prompt ack
-		// still finalizes it via handleDeletionAcknowledged even without
-		// retry tracking; it just won't be retried/audited if the ack never
-		// arrives until the next code path touches it.
 		log.Error("Failed to enroll non-deferred delete in cleanup retry tracking", "instance_id", instanceID, "error", err)
+		return service.NewInternalError(fmt.Sprintf("failed to enroll instance %s for deletion retry: %v", instanceID, err))
+	}
+	claimed, claimErr := s.store.ServiceTypeInstance().ClaimDeletionAttempt(ctx, instanceID, nil)
+	if claimErr != nil {
+		log.Error("Failed to claim non-deferred delete publish", "instance_id", instanceID, "error", claimErr)
+		return service.NewInternalError(fmt.Sprintf("failed to claim deletion attempt for instance %s: %v", instanceID, claimErr))
+	}
+	if !claimed {
+		log.Debug("Cleanup scheduler already claimed delete publication", "instance_id", instanceID)
+		return nil
+	}
+
+	if err := s.publisher.PublishDelete(ctx, subject, messaging.DeletePayload{
+		ResourceID:  instance.ID,
+		ServiceType: instance.ServiceType,
+	}); err != nil {
+		// Cleanup has already been scheduled, so the cleanup worker will retry
+		// this publication without requiring a caller retry.
+		log.Error("Failed to publish delete to agent, cleanup will retry",
+			"instance_id", instanceID, "error", err)
+		return service.NewProvisioningError(fmt.Sprintf("failed to publish delete for instance %s: %v", instanceID, err))
 	}
 
 	log.Info("Delete requested, awaiting agent acknowledgement", "instance_id", instance.ID)

@@ -223,24 +223,39 @@ func (s *PlacementService) progressRunDeletion(ctx context.Context, runID string
 			return nil
 		}
 
-		// Wait until all in-flight deletions are finalized before starting the next dag level.
-		for _, r := range resources {
-			if r.Status == types.ResourceStatusDeleting {
-				return nil
-			}
-		}
-
 		nextLevel := highestPendingDeletionLevel(resources)
 		if nextLevel < 0 {
+			for _, r := range resources {
+				if r.Status == types.ResourceStatusDeleting {
+					return nil
+				}
+			}
 			if allResourcesDeleted(resources) {
-				if err := s.store.Resource().DeleteByRunID(ctx, runID); err != nil {
-					if errors.Is(err, store.ErrResourceNotFound) {
-						return nil
+				retainForRollback := true
+				for _, resource := range resources {
+					if resource.CleanupIntent != string(store.CleanupIntentRollback) {
+						retainForRollback = false
+						break
 					}
-					return NewInternalError(fmt.Sprintf("failed to clean up completed run %s: %v", runID, err))
+				}
+				if !retainForRollback {
+					if err := s.store.Resource().DeleteByRunID(ctx, runID); err != nil {
+						if errors.Is(err, store.ErrResourceNotFound) {
+							return nil
+						}
+						return NewInternalError(fmt.Sprintf("failed to clean up completed run %s: %v", runID, err))
+					}
 				}
 			}
 			return nil
+		}
+
+		// Continue dispatching pending siblings at this level, but do not
+		// advance below an in-flight delete at a higher level.
+		for _, r := range resources {
+			if r.Status == types.ResourceStatusDeleting && r.DagLevel > nextLevel {
+				return nil
+			}
 		}
 
 		anyDeleting := false
@@ -303,6 +318,57 @@ func (s *PlacementService) progressRunDeletion(ctx context.Context, runID string
 			// else: entire level was already absent in SPRM, keep progressing now.
 		}
 	}
+}
+
+// OnAgentError persists the newest assigned-agent error and starts rollback.
+func (s *PlacementService) OnAgentError(ctx context.Context, resourceID, agentName string, streamSequence uint64, details types.AgentErrorDetails) error {
+	accepted, err := s.store.Resource().UpdateAgentError(ctx, resourceID, agentName, streamSequence, details)
+	if err != nil {
+		return NewInternalError(fmt.Sprintf("failed to persist agent error for resource %s: %v", resourceID, err))
+	}
+	if !accepted {
+		return nil
+	}
+
+	resource, err := s.store.Resource().Get(ctx, resourceID)
+	if err != nil {
+		if errors.Is(err, store.ErrResourceNotFound) {
+			return NewNotFoundError(fmt.Sprintf("resource %s not found", resourceID))
+		}
+		return NewInternalError(fmt.Sprintf("failed to load resource %s: %v", resourceID, err))
+	}
+	switch resource.Status {
+	case types.ResourceStatusPendingDeletion, types.ResourceStatusDeleting, types.ResourceStatusDeleted:
+		return s.progressRunDeletion(ctx, resource.RunID)
+	}
+	if resource.Status != types.ResourceStatusFailed {
+		applied, err := s.store.Resource().UpdateStatusFrom(ctx, resourceID,
+			[]string{
+				types.ResourceStatusPending,
+				types.ResourceStatusProvisioning,
+				types.ResourceStatusRunning,
+			},
+			types.ResourceStatusFailed,
+		)
+		if err != nil {
+			return NewInternalError(fmt.Sprintf("failed to set FAILED status for resource %s: %v", resourceID, err))
+		}
+		if !applied {
+			resource, err = s.store.Resource().Get(ctx, resourceID)
+			if err != nil {
+				return NewInternalError(fmt.Sprintf("failed to reload resource %s after failure status CAS: %v", resourceID, err))
+			}
+			switch resource.Status {
+			case types.ResourceStatusFailed:
+				return s.beginRunDeletion(ctx, resource.RunID, store.CleanupIntentRollback)
+			case types.ResourceStatusPendingDeletion, types.ResourceStatusDeleting, types.ResourceStatusDeleted:
+				return s.progressRunDeletion(ctx, resource.RunID)
+			default:
+				return nil
+			}
+		}
+	}
+	return s.beginRunDeletion(ctx, resource.RunID, store.CleanupIntentRollback)
 }
 
 // OnResourceFailed halts progression and starts run teardown.

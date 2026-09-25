@@ -11,6 +11,7 @@ import (
 
 	agentstore "github.com/dcm-project/control-plane/internal/agent/store/agent"
 	placementservice "github.com/dcm-project/control-plane/internal/placement/service"
+	placementtypes "github.com/dcm-project/control-plane/internal/placement/types"
 	"github.com/dcm-project/control-plane/internal/sp/messaging"
 	"github.com/dcm-project/control-plane/internal/sp/store"
 	"github.com/dcm-project/control-plane/internal/sp/store/model"
@@ -43,17 +44,77 @@ type eventData struct {
 	AgentName string `json:"agent_name"`
 }
 
+type agentErrorEventData struct {
+	ResourceID string             `json:"resource_id"`
+	AgentName  string             `json:"agent_name"`
+	Error      string             `json:"error"`
+	Details    *agentErrorDetails `json:"details"`
+}
+
+type agentErrorDetails struct {
+	Message       string               `json:"message"`
+	ProviderError *providerErrorDetail `json:"provider_error"`
+}
+
+type providerErrorDetail struct {
+	StatusCode *int   `json:"status_code"`
+	Message    string `json:"message"`
+}
+
+func (d agentErrorEventData) statusMessage() string {
+	if d.Details != nil {
+		if d.Details.ProviderError != nil && d.Details.ProviderError.Message != "" {
+			return d.Details.ProviderError.Message
+		}
+		if d.Details.Message != "" {
+			return d.Details.Message
+		}
+	}
+	return d.Error
+}
+
+func (d agentErrorEventData) placementDetails() placementtypes.AgentErrorDetails {
+	details := placementtypes.AgentErrorDetails{Error: d.Error}
+	if d.Details != nil {
+		details.Message = d.Details.Message
+		if providerError := d.Details.ProviderError; providerError != nil {
+			details.ProviderError = &placementtypes.AgentProviderError{
+				StatusCode: providerError.StatusCode,
+				Message:    providerError.Message,
+			}
+		}
+	}
+	return details
+}
+
+func (d agentErrorEventData) safeLogAttrs() []any {
+	detailsMessage := ""
+	var statusCode *int
+	if d.Details != nil {
+		detailsMessage = d.Details.Message
+		if d.Details.ProviderError != nil {
+			statusCode = d.Details.ProviderError.StatusCode
+		}
+	}
+	attrs := []any{"error", d.Error, "details_message", detailsMessage}
+	if statusCode != nil {
+		attrs = append(attrs, "provider_status_code", *statusCode)
+	}
+	return attrs
+}
+
 type ResponseConsumer struct {
-	js         jetstream.JetStream
-	store      store.Store
-	publisher  *messaging.Publisher
-	agentStore agentstore.Agent
-	onDeleted  func(context.Context, string) error
-	maxDeliver int
-	ackWait    time.Duration
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	js           jetstream.JetStream
+	store        store.Store
+	publisher    *messaging.Publisher
+	agentStore   agentstore.Agent
+	onDeleted    func(context.Context, string) error
+	onAgentError func(context.Context, string, string, uint64, placementtypes.AgentErrorDetails) error
+	maxDeliver   int
+	ackWait      time.Duration
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
 }
 
 // ResponseOption configures ResponseConsumer behavior.
@@ -64,6 +125,13 @@ type ResponseOption func(*ResponseConsumer)
 func SetPlacementDeletionHandler(onDeleted func(context.Context, string) error) ResponseOption {
 	return func(c *ResponseConsumer) {
 		c.onDeleted = onDeleted
+	}
+}
+
+// SetPlacementAgentErrorHandler registers the callback for accepted agent errors.
+func SetPlacementAgentErrorHandler(onAgentError func(context.Context, string, string, uint64, placementtypes.AgentErrorDetails) error) ResponseOption {
+	return func(c *ResponseConsumer) {
+		c.onAgentError = onAgentError
 	}
 }
 
@@ -167,7 +235,17 @@ func (c *ResponseConsumer) handleMessage(msg jetstream.Msg) {
 	}
 
 	var data eventData
-	if err := json.Unmarshal(ce.Data, &data); err != nil {
+	var agentError *agentErrorEventData
+	if ce.Type == messaging.CETypeError {
+		var errorData agentErrorEventData
+		if err := json.Unmarshal(ce.Data, &errorData); err != nil {
+			slog.Error("malformed event data, acking to discard", "error", err)
+			_ = msg.Ack()
+			return
+		}
+		data = eventData{ResourceID: errorData.ResourceID, AgentName: errorData.AgentName}
+		agentError = &errorData
+	} else if err := json.Unmarshal(ce.Data, &data); err != nil {
 		slog.Error("malformed event data, acking to discard", "error", err)
 		_ = msg.Ack()
 		return
@@ -214,7 +292,7 @@ func (c *ResponseConsumer) handleMessage(msg jetstream.Msg) {
 		fromStatuses = []string{model.StatusPending, model.StatusQueued}
 	case messaging.CETypeError:
 		newStatus = model.StatusFailed
-		fromStatuses = []string{model.StatusPending, model.StatusQueued, model.StatusProvisioning}
+		fromStatuses = []string{model.StatusPending, model.StatusQueued, model.StatusProvisioning, model.StatusFailed}
 	case messaging.CETypeCancelAcknowledged:
 		newStatus = model.StatusCancelled
 		fromStatuses = []string{model.StatusQueued}
@@ -224,21 +302,52 @@ func (c *ResponseConsumer) handleMessage(msg jetstream.Msg) {
 		return
 	}
 
+	statusMessage := ""
+	if agentError != nil {
+		statusMessage = agentError.statusMessage()
+	}
 	stiStore := c.store.ServiceTypeInstance()
-	applied, err := stiStore.UpdateStatusFrom(ctx, data.ResourceID, fromStatuses, data.AgentName, newStatus, "")
-	if err != nil {
-		slog.Error("failed to update status, nacking", "instance_id", data.ResourceID, "event_type", ce.Type, "agent_name", data.AgentName, "error", err)
-		_ = msg.NakWithDelay(5 * time.Second)
-		return
+	var applied bool
+	var streamSequence uint64
+	if agentError != nil {
+		metadata, err := msg.Metadata()
+		if err != nil {
+			slog.Error("failed to read agent error stream sequence, nacking", "instance_id", data.ResourceID, "error", err)
+			_ = msg.NakWithDelay(5 * time.Second)
+			return
+		}
+		streamSequence = metadata.Sequence.Stream
+		applied, err = stiStore.UpdateAgentErrorFrom(ctx, data.ResourceID, fromStatuses, data.AgentName, streamSequence, newStatus, statusMessage)
+		if err != nil {
+			slog.Error("failed to update agent error, nacking", "instance_id", data.ResourceID, "event_type", ce.Type, "agent_name", data.AgentName, "stream_sequence", streamSequence, "error", err)
+			_ = msg.NakWithDelay(5 * time.Second)
+			return
+		}
+	} else {
+		var err error
+		applied, err = stiStore.UpdateStatusFrom(ctx, data.ResourceID, fromStatuses, data.AgentName, newStatus, statusMessage)
+		if err != nil {
+			slog.Error("failed to update status, nacking", "instance_id", data.ResourceID, "event_type", ce.Type, "agent_name", data.AgentName, "error", err)
+			_ = msg.NakWithDelay(5 * time.Second)
+			return
+		}
+	}
+	logAttrs := []any{"instance_id", data.ResourceID, "event_type", ce.Type, "agent_name", data.AgentName}
+	if agentError != nil {
+		logAttrs = append(logAttrs, agentError.safeLogAttrs()...)
+		logAttrs = append(logAttrs, "stream_sequence", streamSequence)
 	}
 	if !applied {
-		// A second read would tell us status- vs agent-mismatch but
-		// reintroduce a TOCTOU window purely for logging; include agent_name
-		// so operators can cross-reference it against the DB instead.
-		slog.Info("stale or duplicate status event, instance already moved on, agent mismatch, or not found, acking",
-			"instance_id", data.ResourceID, "event_type", ce.Type, "agent_name", data.AgentName)
+		slog.Info("stale or duplicate status event, instance already moved on, agent mismatch, or not found, acking", logAttrs...)
 	} else {
-		slog.Info("status transition applied", "instance_id", data.ResourceID, "event_type", ce.Type, "agent_name", data.AgentName, "status", newStatus)
+		slog.Info("status transition applied", append(logAttrs, "status", newStatus)...)
+		if agentError != nil && c.onAgentError != nil {
+			if err := c.onAgentError(ctx, data.ResourceID, data.AgentName, streamSequence, agentError.placementDetails()); err != nil {
+				slog.Error("failed to notify Placement of agent error, nacking", "instance_id", data.ResourceID, "agent_name", data.AgentName, "stream_sequence", streamSequence, "error", err)
+				_ = msg.NakWithDelay(5 * time.Second)
+				return
+			}
+		}
 	}
 
 	_ = msg.Ack()
@@ -378,20 +487,32 @@ func (c *ResponseConsumer) handleCancelRejected(ctx context.Context, data eventD
 
 	// Enroll in cleanup's retry/timeout tracking, not just the best-effort
 	// republish below: otherwise a failed republish is never retried.
+	canPublish := true
 	if err := stiStore.MarkForDeletion(ctx, data.ResourceID); err != nil {
 		slog.Error("cancel-rejected: failed to enroll instance in deletion retry tracking", "instance_id", data.ResourceID, "event_type", messaging.CETypeCancelRejected, "agent_name", data.AgentName, "error", err)
+	} else {
+		claimed, claimErr := stiStore.ClaimDeletionAttempt(ctx, data.ResourceID, nil)
+		if claimErr != nil {
+			slog.Error("cancel-rejected: failed to claim delete publication, sweep will retry", "instance_id", data.ResourceID, "event_type", messaging.CETypeCancelRejected, "agent_name", data.AgentName, "error", claimErr)
+			canPublish = false
+		} else if !claimed {
+			slog.Info("cancel-rejected: cleanup scheduler already claimed delete publication", "instance_id", data.ResourceID, "event_type", messaging.CETypeCancelRejected, "agent_name", data.AgentName)
+			canPublish = false
+		}
 	}
 
-	instance, err := stiStore.Get(ctx, data.ResourceID, true)
-	if err == nil && instance.AgentName != nil {
-		subject, ok := c.resolveAgentTopic(ctx, *instance.AgentName)
-		if ok {
-			payload := messaging.DeletePayload{
-				ResourceID:  data.ResourceID,
-				ServiceType: instance.ServiceType,
-			}
-			if pubErr := c.publisher.PublishDelete(ctx, subject, payload); pubErr != nil {
-				slog.Warn("cancel-rejected: publish delete failed, sweep will retry", "instance_id", data.ResourceID, "error", pubErr)
+	if canPublish {
+		instance, err := stiStore.Get(ctx, data.ResourceID, true)
+		if err == nil && instance.AgentName != nil {
+			subject, ok := c.resolveAgentTopic(ctx, *instance.AgentName)
+			if ok {
+				payload := messaging.DeletePayload{
+					ResourceID:  data.ResourceID,
+					ServiceType: instance.ServiceType,
+				}
+				if pubErr := c.publisher.PublishDelete(ctx, subject, payload); pubErr != nil {
+					slog.Warn("cancel-rejected: publish delete failed, sweep will retry", "instance_id", data.ResourceID, "error", pubErr)
+				}
 			}
 		}
 	}

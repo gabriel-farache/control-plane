@@ -12,13 +12,14 @@ type ServiceTypeInstance struct {
 	// hot-path queries (status = ? AND pending_started_at < ?), which
 	// without it would degrade to a full table scan on every sweep tick as
 	// the instance count grows.
-	Status        string         `gorm:"column:status;not null;index:idx_sti_status_pending,priority:1"`
-	StatusMessage string         `gorm:"column:status_message"`
-	OutputSpec    map[string]any `gorm:"column:output_spec;type:jsonb;serializer:json"`
-	InstanceName  string         `gorm:"column:instance_name;not null"`
-	Spec          map[string]any `gorm:"column:spec;type:jsonb;serializer:json;not null"`
-	CreateTime    time.Time      `gorm:"column:create_time;autoCreateTime"`
-	UpdateTime    time.Time      `gorm:"column:update_time;autoUpdateTime"`
+	Status                   string         `gorm:"column:status;not null;index:idx_sti_status_pending,priority:1"`
+	StatusMessage            string         `gorm:"column:status_message"`
+	AgentErrorStreamSequence uint64         `gorm:"column:agent_error_stream_sequence;not null;default:0"`
+	OutputSpec               map[string]any `gorm:"column:output_spec;type:jsonb;serializer:json"`
+	InstanceName             string         `gorm:"column:instance_name;not null"`
+	Spec                     map[string]any `gorm:"column:spec;type:jsonb;serializer:json;not null"`
+	CreateTime               time.Time      `gorm:"column:create_time;autoCreateTime"`
+	UpdateTime               time.Time      `gorm:"column:update_time;autoUpdateTime"`
 
 	// AgentName is a plain string reference to the owning agent's natural key.
 	// Intentionally NOT a GORM foreign key: agents can be deregistered while

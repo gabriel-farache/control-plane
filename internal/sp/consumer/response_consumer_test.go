@@ -4,14 +4,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
 
+	agentstore "github.com/dcm-project/control-plane/internal/agent/store/agent"
 	agentmodel "github.com/dcm-project/control-plane/internal/agent/store/model"
+	placementtypes "github.com/dcm-project/control-plane/internal/placement/types"
+	"github.com/dcm-project/control-plane/internal/sp/cleanup"
+	"github.com/dcm-project/control-plane/internal/sp/config"
 	"github.com/dcm-project/control-plane/internal/sp/consumer"
+	"github.com/dcm-project/control-plane/internal/sp/messaging"
 	"github.com/dcm-project/control-plane/internal/sp/store"
 	"github.com/dcm-project/control-plane/internal/sp/store/model"
+	rmstore "github.com/dcm-project/control-plane/internal/sp/store/resource_manager"
 	"github.com/google/uuid"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -22,6 +29,49 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+type recordingJetStream struct {
+	jetstream.JetStream
+	mu              sync.Mutex
+	deletePublishes int
+}
+
+func (s *recordingJetStream) Publish(ctx context.Context, subject string, data []byte, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	if subject == "dcm.agent.test-agent" {
+		s.mu.Lock()
+		s.deletePublishes++
+		s.mu.Unlock()
+	}
+	return s.JetStream.Publish(ctx, subject, data, opts...)
+}
+
+func (s *recordingJetStream) deletePublishCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deletePublishes
+}
+
+type responseStoreOverride struct {
+	store.Store
+	instance rmstore.ServiceTypeInstance
+}
+
+func (s *responseStoreOverride) ServiceTypeInstance() rmstore.ServiceTypeInstance {
+	return s.instance
+}
+
+type runSchedulerAfterMarkForDeletion struct {
+	rmstore.ServiceTypeInstance
+	scheduler *cleanup.Scheduler
+}
+
+func (s *runSchedulerAfterMarkForDeletion) MarkForDeletion(ctx context.Context, id string) error {
+	if err := s.ServiceTypeInstance.MarkForDeletion(ctx, id); err != nil {
+		return err
+	}
+	s.scheduler.ProcessPendingDeletions(ctx)
+	return nil
+}
 
 var _ = Describe("ResponseConsumer", func() {
 	var (
@@ -203,17 +253,302 @@ var _ = Describe("ResponseConsumer", func() {
 		}, 2*time.Second, 20*time.Millisecond).Should(Equal("failed"))
 	})
 
+	It("stores the provider error message and logs safe error fields", func() {
+		instance := createPendingInstance(ctx, db)
+		var buf syncBuffer
+		prevLogger := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+		defer slog.SetDefault(prevLogger)
+
+		Expect(rc.Start(ctx)).To(Succeed())
+
+		const providerBody = "SENSITIVE_PROVIDER_RESPONSE_BODY"
+		publishAgentEventWithData(js, "dcm.agent.error", map[string]any{
+			"resource_id": instance.ID,
+			"agent_name":  testAgentName,
+			"error":       "provider request failed",
+			"details": map[string]any{
+				"message": "agent failure summary",
+				"provider_error": map[string]any{
+					"status_code": 503,
+					"message":     providerBody,
+				},
+			},
+		})
+
+		Eventually(func() string { return currentStatus(db, instance.ID) }, 2*time.Second, 20*time.Millisecond).Should(Equal("failed"))
+		Eventually(func() string { return currentStatusMessage(db, instance.ID) }, 2*time.Second, 20*time.Millisecond).Should(Equal(providerBody))
+		Eventually(buf.String, 2*time.Second, 20*time.Millisecond).Should(SatisfyAll(
+			ContainSubstring(`="provider request failed"`),
+			ContainSubstring(`="agent failure summary"`),
+			ContainSubstring("=503"),
+		))
+		Expect(buf.String()).NotTo(ContainSubstring(providerBody))
+	})
+
+	It("falls back from provider details to details.message, top-level error, and an empty message", func() {
+		Expect(rc.Start(ctx)).To(Succeed())
+
+		for _, tc := range []struct {
+			name    string
+			data    map[string]any
+			message string
+		}{
+			{
+				name: "details.message",
+				data: map[string]any{
+					"error":   "top-level fallback",
+					"details": map[string]any{"message": "details fallback"},
+				},
+				message: "details fallback",
+			},
+			{
+				name:    "top-level error",
+				data:    map[string]any{"error": "top-level fallback"},
+				message: "top-level fallback",
+			},
+			{
+				name: "empty",
+				data: map[string]any{},
+			},
+		} {
+			instance := createPendingInstance(ctx, db)
+			tc.data["resource_id"] = instance.ID
+			tc.data["agent_name"] = testAgentName
+			By(tc.name)
+			publishAgentEventWithData(js, "dcm.agent.error", tc.data)
+
+			Eventually(func() string { return currentStatus(db, instance.ID) }, 2*time.Second, 20*time.Millisecond).Should(Equal("failed"))
+			Expect(currentStatusMessage(db, instance.ID)).To(Equal(tc.message))
+		}
+	})
+
+	It("updates the failure message on a repeated error from the assigned agent", func() {
+		instance := createPendingInstance(ctx, db)
+		Expect(rc.Start(ctx)).To(Succeed())
+
+		publishAgentEventWithData(js, "dcm.agent.error", map[string]any{
+			"resource_id": instance.ID,
+			"agent_name":  testAgentName,
+			"details":     map[string]any{"message": "first failure"},
+		})
+		Eventually(func() string { return currentStatusMessage(db, instance.ID) }, 2*time.Second, 20*time.Millisecond).Should(Equal("first failure"))
+
+		publishAgentEventWithData(js, "dcm.agent.error", map[string]any{
+			"resource_id": instance.ID,
+			"agent_name":  testAgentName,
+			"details":     map[string]any{"message": "latest failure"},
+		})
+		Eventually(func() string { return currentStatusMessage(db, instance.ID) }, 2*time.Second, 20*time.Millisecond).Should(Equal("latest failure"))
+		Expect(currentStatus(db, instance.ID)).To(Equal("failed"))
+	})
+
+	It("calls Placement with structured details only for the assigned agent", func() {
+		rc.Stop()
+		type placementCall struct {
+			resourceID string
+			agentName  string
+			sequence   uint64
+			details    placementtypes.AgentErrorDetails
+		}
+		var mu sync.Mutex
+		calls := make([]placementCall, 0, 1)
+		rc = consumer.NewResponseConsumer(
+			js,
+			dataStore,
+			nil,
+			0,
+			0,
+			consumer.SetPlacementAgentErrorHandler(func(_ context.Context, resourceID, agentName string, sequence uint64, details placementtypes.AgentErrorDetails) error {
+				mu.Lock()
+				defer mu.Unlock()
+				calls = append(calls, placementCall{resourceID: resourceID, agentName: agentName, sequence: sequence, details: details})
+				return nil
+			}),
+		)
+		instance := createPendingInstance(ctx, db)
+		Expect(rc.Start(ctx)).To(Succeed())
+
+		publishAgentEventWithData(js, "dcm.agent.error", map[string]any{
+			"resource_id": instance.ID,
+			"agent_name":  staleAgentName,
+			"error":       "stale failure",
+			"details":     map[string]any{"message": "stale details"},
+		})
+		Consistently(func() int {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(calls)
+		}, 200*time.Millisecond, 20*time.Millisecond).Should(BeZero())
+
+		statusCode := 503
+		publishAgentEventWithData(js, "dcm.agent.error", map[string]any{
+			"resource_id": instance.ID,
+			"agent_name":  testAgentName,
+			"error":       "provider request failed",
+			"details": map[string]any{
+				"message":        "agent summary",
+				"provider_error": map[string]any{"status_code": statusCode, "message": "provider body"},
+			},
+		})
+		Eventually(func() int {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(calls)
+		}, 2*time.Second, 20*time.Millisecond).Should(Equal(1))
+		mu.Lock()
+		call := calls[0]
+		mu.Unlock()
+		Expect(call.resourceID).To(Equal(instance.ID))
+		Expect(call.agentName).To(Equal(testAgentName))
+		Expect(call.sequence).To(BeNumerically(">", 0))
+		Expect(call.details).To(Equal(placementtypes.AgentErrorDetails{
+			Error:   "provider request failed",
+			Message: "agent summary",
+			ProviderError: &placementtypes.AgentProviderError{
+				StatusCode: &statusCode,
+				Message:    "provider body",
+			},
+		}))
+	})
+
+	It("retries an equal-sequence Placement notification after a partial failure", func() {
+		rc.Stop()
+		var mu sync.Mutex
+		sequences := make([]uint64, 0, 2)
+		var calls int
+		rc = consumer.NewResponseConsumer(
+			js,
+			dataStore,
+			nil,
+			0,
+			0,
+			consumer.SetPlacementAgentErrorHandler(func(_ context.Context, _, _ string, sequence uint64, _ placementtypes.AgentErrorDetails) error {
+				mu.Lock()
+				defer mu.Unlock()
+				calls++
+				sequences = append(sequences, sequence)
+				if calls == 1 {
+					return errors.New("temporary placement failure")
+				}
+				return nil
+			}),
+		)
+		instance := createPendingInstance(ctx, db)
+		Expect(rc.Start(ctx)).To(Succeed())
+		publishAgentEventWithData(js, "dcm.agent.error", map[string]any{
+			"resource_id": instance.ID,
+			"agent_name":  testAgentName,
+			"error":       "failure",
+			"details":     map[string]any{"message": "summary"},
+		})
+
+		Eventually(func() int {
+			mu.Lock()
+			defer mu.Unlock()
+			return calls
+		}, 2*time.Second, 20*time.Millisecond).Should(Equal(1))
+		mu.Lock()
+		firstSequence := sequences[0]
+		mu.Unlock()
+		Expect(currentStatus(db, instance.ID)).To(Equal("failed"))
+		Expect(currentAgentErrorStreamSequence(db, instance.ID)).To(Equal(firstSequence))
+		var persisted model.ServiceTypeInstance
+		Expect(db.First(&persisted, "id = ?", instance.ID).Error).NotTo(HaveOccurred())
+		Expect(persisted.AgentName).NotTo(BeNil())
+		Expect(*persisted.AgentName).To(Equal(testAgentName))
+		Eventually(func() int {
+			mu.Lock()
+			defer mu.Unlock()
+			return calls
+		}, 7*time.Second, 20*time.Millisecond).Should(Equal(2))
+		mu.Lock()
+		defer mu.Unlock()
+		Expect(sequences[0]).To(BeNumerically(">", 0))
+		Expect(sequences[1]).To(Equal(sequences[0]))
+	})
+
+	It("does not let an older redelivery overwrite a newer accepted error", func() {
+		rc.Stop()
+		var mu sync.Mutex
+		var calls int
+		var placedDetails placementtypes.AgentErrorDetails
+		var placedSequence uint64
+		rc = consumer.NewResponseConsumer(
+			js,
+			dataStore,
+			nil,
+			0,
+			0,
+			consumer.SetPlacementAgentErrorHandler(func(_ context.Context, _, _ string, sequence uint64, details placementtypes.AgentErrorDetails) error {
+				mu.Lock()
+				defer mu.Unlock()
+				calls++
+				if details.Error == "E1" {
+					return errors.New("temporary failure for first event")
+				}
+				placedDetails = details
+				placedSequence = sequence
+				return nil
+			}),
+		)
+		instance := createPendingInstance(ctx, db)
+		Expect(rc.Start(ctx)).To(Succeed())
+		publishAgentEventWithData(js, "dcm.agent.error", map[string]any{
+			"resource_id": instance.ID,
+			"agent_name":  testAgentName,
+			"error":       "E1",
+			"details":     map[string]any{"message": "first"},
+		})
+		Eventually(func() int {
+			mu.Lock()
+			defer mu.Unlock()
+			return calls
+		}, 2*time.Second, 20*time.Millisecond).Should(Equal(1))
+
+		publishAgentEventWithData(js, "dcm.agent.error", map[string]any{
+			"resource_id": instance.ID,
+			"agent_name":  testAgentName,
+			"error":       "E2",
+			"details":     map[string]any{"message": "second"},
+		})
+		Eventually(func() string { return currentStatusMessage(db, instance.ID) }, 2*time.Second, 20*time.Millisecond).Should(Equal("second"))
+		mu.Lock()
+		Expect(placedDetails.Error).To(Equal("E2"))
+		Expect(placedDetails.Message).To(Equal("second"))
+		Expect(placedSequence).To(BeNumerically(">", 0))
+		Expect(calls).To(Equal(2))
+		mu.Unlock()
+
+		Consistently(func() string { return currentStatusMessage(db, instance.ID) }, 6*time.Second, 50*time.Millisecond).Should(Equal("second"))
+		mu.Lock()
+		Expect(calls).To(Equal(2))
+		mu.Unlock()
+	})
+
 	// Same mismatch treatment as creation-acknowledged, for the error event.
 	It("ignores an error event from a superseded agent even though status still matches (identity check)", func() {
 		instance := createPendingInstance(ctx, db)
 
 		Expect(rc.Start(ctx)).To(Succeed())
 
-		publishAgentEvent(js, "dcm.agent.error", instance.ID, staleAgentName)
+		publishAgentEventWithData(js, "dcm.agent.error", map[string]any{
+			"resource_id": instance.ID,
+			"agent_name":  staleAgentName,
+			"error":       "stale failure",
+			"details": map[string]any{
+				"message": "stale details",
+				"provider_error": map[string]any{
+					"status_code": 503,
+					"message":     "stale provider body",
+				},
+			},
+		})
 
 		Consistently(func() string {
 			return currentStatus(db, instance.ID)
 		}, 300*time.Millisecond, 20*time.Millisecond).Should(Equal("pending"))
+		Expect(currentStatusMessage(db, instance.ID)).To(BeEmpty())
 	})
 
 	It("transitions to QUEUED and resets the pending timer on request-queued", func() {
@@ -522,6 +857,50 @@ var _ = Describe("ResponseConsumer", func() {
 		Expect(*updated.DeletionStatus).To(Equal("SCHEDULED"))
 	})
 
+	It("does not duplicate cancel-rejected deletion when the cleanup scheduler claims first", func() {
+		instance := createPendingInstance(ctx, db)
+		Expect(db.Model(&instance).Update("status", model.StatusQueued).Error).NotTo(HaveOccurred())
+
+		sharedJS := &recordingJetStream{JetStream: js}
+		requestPublisher := messaging.NewPublisher(sharedJS)
+		Expect(requestPublisher.EnsureStream(ctx)).To(Succeed())
+		scheduler := cleanup.NewScheduler(
+			dataStore, requestPublisher, agentstore.NewAgent(db),
+			&config.CleanupConfig{Interval: time.Hour, MaxRetries: 3},
+		)
+		wrappedStore := &responseStoreOverride{
+			Store: dataStore,
+			instance: &runSchedulerAfterMarkForDeletion{
+				ServiceTypeInstance: dataStore.ServiceTypeInstance(),
+				scheduler:           scheduler,
+			},
+		}
+		rc = consumer.NewResponseConsumer(sharedJS, wrappedStore, agentstore.NewAgent(db), 0, 0)
+		Expect(rc.Start(ctx)).To(Succeed())
+
+		publishAgentEvent(js, "dcm.agent.cancel-rejected", instance.ID, testAgentName)
+
+		Eventually(func() string {
+			return currentStatus(db, instance.ID)
+		}, 2*time.Second, 20*time.Millisecond).Should(Equal(model.StatusPendingDeletion))
+		Eventually(func() uint64 {
+			responseStream, err := js.Stream(ctx, messaging.ResponseStreamName)
+			if err != nil {
+				return 0
+			}
+			responseConsumer, err := responseStream.Consumer(ctx, "control-plane-response-consumer")
+			if err != nil {
+				return 0
+			}
+			info, err := responseConsumer.Info(ctx)
+			if err != nil {
+				return 0
+			}
+			return info.AckFloor.Stream
+		}, 2*time.Second, 20*time.Millisecond).Should(BeNumerically(">=", 1))
+		Expect(sharedJS.deletePublishCount()).To(Equal(1))
+	})
+
 	It("logs the status transition on a successful cancel-rejected", func() {
 		instance := createPendingInstance(ctx, db)
 		Expect(db.Model(&instance).Update("status", model.StatusQueued).Error).NotTo(HaveOccurred())
@@ -736,6 +1115,18 @@ func currentStatus(db *gorm.DB, id string) string {
 	return updated.Status
 }
 
+func currentStatusMessage(db *gorm.DB, id string) string {
+	var updated model.ServiceTypeInstance
+	Expect(db.First(&updated, "id = ?", id).Error).NotTo(HaveOccurred())
+	return updated.StatusMessage
+}
+
+func currentAgentErrorStreamSequence(db *gorm.DB, id string) uint64 {
+	var updated model.ServiceTypeInstance
+	Expect(db.First(&updated, "id = ?", id).Error).NotTo(HaveOccurred())
+	return updated.AgentErrorStreamSequence
+}
+
 func createPendingInstance(_ context.Context, db *gorm.DB) model.ServiceTypeInstance {
 	agentName := testAgentName
 	now := time.Now()
@@ -764,12 +1155,16 @@ const testAgentName = "test-agent"
 const staleAgentName = "stale-agent"
 
 func publishAgentEvent(js jetstream.JetStream, eventType string, resourceID string, agentName string) {
+	publishAgentEventWithData(js, eventType, map[string]any{"resource_id": resourceID, "agent_name": agentName})
+}
+
+func publishAgentEventWithData(js jetstream.JetStream, eventType string, eventData map[string]any) {
 	data, err := json.Marshal(map[string]any{
 		"specversion": "1.0",
 		"type":        eventType,
 		"source":      "test",
 		"id":          uuid.New().String(),
-		"data":        map[string]any{"resource_id": resourceID, "agent_name": agentName},
+		"data":        eventData,
 	})
 	Expect(err).NotTo(HaveOccurred())
 	ctx := context.Background()

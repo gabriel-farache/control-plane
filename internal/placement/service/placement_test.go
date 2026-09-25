@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 
 	agentmodel "github.com/dcm-project/control-plane/internal/agent/store/model"
 	placementagent "github.com/dcm-project/control-plane/internal/placement/agent"
@@ -89,6 +90,73 @@ func (m *mockSPRMClient) ReassignResource(ctx context.Context, resourceId string
 		return m.ReassignResourceFunc(ctx, resourceId, agentName, expectedCurrentAgent)
 	}
 	return nil
+}
+
+type blockingResourceStore struct {
+	store.Resource
+	runID    string
+	snapshot chan struct{}
+	release  chan struct{}
+	mu       sync.Mutex
+	blocked  bool
+}
+
+func (s *blockingResourceStore) ListByRunID(ctx context.Context, runID string) (model.ResourceList, error) {
+	resources, err := s.Resource.ListByRunID(ctx, runID)
+	if err != nil || runID != s.runID {
+		return resources, err
+	}
+	pendingDeletion := false
+	for _, resource := range resources {
+		if resource.Status == types.ResourceStatusPendingDeletion {
+			pendingDeletion = true
+			break
+		}
+	}
+	if !pendingDeletion {
+		return resources, nil
+	}
+
+	s.mu.Lock()
+	shouldBlock := !s.blocked
+	s.blocked = true
+	s.mu.Unlock()
+	if shouldBlock {
+		close(s.snapshot)
+		<-s.release
+	}
+	return resources, nil
+}
+
+type resourceOverrideStore struct {
+	store.Store
+	resource store.Resource
+}
+
+func (s *resourceOverrideStore) Resource() store.Resource {
+	return s.resource
+}
+
+type deletionRaceResourceStore struct {
+	store.Resource
+	resourceID string
+	runID      string
+	traced     bool
+	raceErr    error
+}
+
+func (s *deletionRaceResourceStore) Get(ctx context.Context, id string) (*model.Resource, error) {
+	resource, err := s.Resource.Get(ctx, id)
+	if err != nil || id != s.resourceID || s.traced {
+		return resource, err
+	}
+	s.traced = true
+	if err := s.Resource.PrepareRunDeletion(ctx, s.runID, store.CleanupIntentExplicit); err != nil {
+		s.raceErr = err
+		return resource, err
+	}
+	s.raceErr = s.Resource.UpdateStatus(ctx, id, types.ResourceStatusDeleting)
+	return resource, nil
 }
 
 type mockAgentClient struct {
@@ -1162,6 +1230,324 @@ var _ = Describe("PlacementService", func() {
 			app, err := dataStore.Resource().Get(ctx, appID)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(app.Status).To(Equal(types.ResourceStatusPending))
+		})
+
+		It("persists only the latest assigned-agent error and starts cleanup once", func() {
+			mockPolicy.EvaluateFunc = func(_ context.Context, req policy.EvaluateRequest) (*policy.EvaluateResponse, error) {
+				return &policy.EvaluateResponse{Status: "APPROVED", SelectedAgent: "test-agent", EvaluatedSpec: req.Spec}, nil
+			}
+			created, err := placementSvc.CreateRun(ctx, singleResourceRun("catalog-agent-error", map[string]any{"kind": "vm"}, nil))
+			Expect(err).NotTo(HaveOccurred())
+			resourceID := *created.Resources[0].Id
+
+			deleteCalls := 0
+			mockSPRM.DeleteResourceFunc = func(_ context.Context, id string) error {
+				Expect(id).To(Equal(resourceID))
+				deleteCalls++
+				return nil
+			}
+			latest := types.AgentErrorDetails{Error: "latest failure", Message: "latest summary"}
+
+			Expect(placementSvc.OnAgentError(ctx, resourceID, "test-agent", 2, latest)).To(Succeed())
+			Expect(placementSvc.OnAgentError(ctx, resourceID, "test-agent", 1, types.AgentErrorDetails{Error: "old failure"})).To(Succeed())
+			Expect(placementSvc.OnAgentError(ctx, resourceID, "stale-agent", 3, types.AgentErrorDetails{Error: "stale agent"})).To(Succeed())
+			Expect(placementSvc.OnAgentError(ctx, resourceID, "test-agent", 2, latest)).To(Succeed())
+
+			stored := getStoredResource(ctx, dataStore, resourceID)
+			Expect(stored.AgentErrorStreamSequence).To(Equal(uint64(2)))
+			Expect(stored.AgentErrorDetails).NotTo(BeNil())
+			Expect(*stored.AgentErrorDetails).To(Equal(latest))
+			Expect(stored.AgentName).NotTo(BeNil())
+			Expect(*stored.AgentName).To(Equal("test-agent"))
+			Expect(deleteCalls).To(Equal(1))
+		})
+
+		It("does not overwrite or redispatch an explicit delete racing with an agent error", func() {
+			created, err := placementSvc.CreateRun(ctx, singleResourceRun("catalog-agent-error-delete-race", map[string]any{"kind": "vm"}, nil))
+			Expect(err).NotTo(HaveOccurred())
+			resourceID := *created.Resources[0].Id
+			Expect(dataStore.Resource().UpdateStatus(ctx, resourceID, types.ResourceStatusRunning)).To(Succeed())
+
+			racingResource := &deletionRaceResourceStore{
+				Resource:   dataStore.Resource(),
+				resourceID: resourceID,
+				runID:      created.RunId,
+			}
+			placementSvc = service.NewPlacementService(
+				&resourceOverrideStore{Store: dataStore, resource: racingResource},
+				mockPolicy,
+				mockSPRM,
+				service.WithAgentClient(agentClient),
+			)
+			deleteCalls := 0
+			mockSPRM.DeleteResourceFunc = func(_ context.Context, _ string) error {
+				deleteCalls++
+				return nil
+			}
+
+			Expect(placementSvc.OnAgentError(ctx, resourceID, "default-agent", 1, types.AgentErrorDetails{Error: "provider failed"})).To(Succeed())
+			Expect(racingResource.raceErr).NotTo(HaveOccurred())
+
+			stored := getStoredResource(ctx, dataStore, resourceID)
+			Expect(stored.Status).To(Equal(types.ResourceStatusDeleting))
+			Expect(stored.CleanupIntent).To(Equal(string(store.CleanupIntentExplicit)))
+			Expect(stored.AgentErrorDetails).NotTo(BeNil())
+			Expect(deleteCalls).To(Equal(0))
+		})
+
+		It("resumes the failed same-level delete without redispatching a successful sibling", func() {
+			mockPolicy.EvaluateFunc = func(_ context.Context, req policy.EvaluateRequest) (*policy.EvaluateResponse, error) {
+				return &policy.EvaluateResponse{Status: "APPROVED", SelectedAgent: "test-agent", EvaluatedSpec: req.Spec}, nil
+			}
+			created, err := placementSvc.CreateRun(ctx, &types.CreateRunRequest{
+				CatalogItemInstanceId: "catalog-agent-error-sibling-retry",
+				RunId:                 uuid.New().String(),
+				Resources: []types.ResourceInput{
+					{Name: "alpha", Spec: map[string]any{"kind": "vm"}},
+					{Name: "zeta", Spec: map[string]any{"kind": "vm"}},
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			ids := make(map[string]string)
+			for _, resource := range created.Resources {
+				ids[resource.Name] = *resource.Id
+			}
+
+			deleteCalls := map[string]int{}
+			mockSPRM.DeleteResourceFunc = func(_ context.Context, id string) error {
+				deleteCalls[id]++
+				if id == ids["zeta"] && deleteCalls[id] == 1 {
+					return errors.New("temporary SPRM failure")
+				}
+				return nil
+			}
+			details := types.AgentErrorDetails{Error: "agent failure"}
+
+			Expect(placementSvc.OnAgentError(ctx, ids["alpha"], "test-agent", 9, details)).To(HaveOccurred())
+			failedSibling := getStoredResource(ctx, dataStore, ids["zeta"])
+			Expect(failedSibling.Status).To(Equal(types.ResourceStatusPendingDeletion))
+			Expect(placementSvc.OnAgentError(ctx, ids["alpha"], "test-agent", 9, details)).To(Succeed())
+
+			Expect(deleteCalls[ids["alpha"]]).To(Equal(1))
+			Expect(deleteCalls[ids["zeta"]]).To(Equal(2))
+		})
+
+		It("retries rollback after an equal-sequence agent error redelivery", func() {
+			mockPolicy.EvaluateFunc = func(_ context.Context, req policy.EvaluateRequest) (*policy.EvaluateResponse, error) {
+				return &policy.EvaluateResponse{Status: "APPROVED", SelectedAgent: "test-agent", EvaluatedSpec: req.Spec}, nil
+			}
+			created, err := placementSvc.CreateRun(ctx, singleResourceRun("catalog-agent-error-retry", map[string]any{"kind": "vm"}, nil))
+			Expect(err).NotTo(HaveOccurred())
+			resourceID := *created.Resources[0].Id
+
+			deleteCalls := 0
+			mockSPRM.DeleteResourceFunc = func(_ context.Context, id string) error {
+				Expect(id).To(Equal(resourceID))
+				deleteCalls++
+				if deleteCalls == 1 {
+					return errors.New("temporary SPRM failure")
+				}
+				return nil
+			}
+			details := types.AgentErrorDetails{Error: "agent failure"}
+
+			Expect(placementSvc.OnAgentError(ctx, resourceID, "test-agent", 7, details)).To(HaveOccurred())
+			Expect(placementSvc.OnAgentError(ctx, resourceID, "test-agent", 7, details)).To(Succeed())
+
+			stored := getStoredResource(ctx, dataStore, resourceID)
+			Expect(stored.Status).To(Equal(types.ResourceStatusDeleting))
+			Expect(deleteCalls).To(Equal(2))
+		})
+
+		It("does not reset DELETED after a fast acknowledgement races a delete error", func() {
+			mockPolicy.EvaluateFunc = func(_ context.Context, req policy.EvaluateRequest) (*policy.EvaluateResponse, error) {
+				return &policy.EvaluateResponse{Status: "APPROVED", SelectedAgent: "test-agent", EvaluatedSpec: req.Spec}, nil
+			}
+			created, err := placementSvc.CreateRun(ctx, &types.CreateRunRequest{
+				CatalogItemInstanceId: "catalog-agent-error-delete-ack-race",
+				RunId:                 uuid.New().String(),
+				Resources: []types.ResourceInput{
+					{Name: "db", Spec: map[string]any{"kind": "db"}},
+					{Name: "app", Spec: map[string]any{"kind": "app"}, RequiresResources: []string{"db"}},
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			ids := make(map[string]string)
+			for _, resource := range created.Resources {
+				ids[resource.Name] = *resource.Id
+			}
+
+			deleteCalls := make(map[string]int)
+			mockSPRM.DeleteResourceFunc = func(callCtx context.Context, id string) error {
+				deleteCalls[id]++
+				if id == ids["app"] && deleteCalls[id] == 1 {
+					Expect(placementSvc.OnResourceDeleted(callCtx, id)).To(Succeed())
+					return errors.New("delete response lost after acknowledgement")
+				}
+				return nil
+			}
+
+			Expect(placementSvc.OnAgentError(ctx, ids["db"], "test-agent", 1, types.AgentErrorDetails{Error: "provider failed"})).To(HaveOccurred())
+			app := getStoredResource(ctx, dataStore, ids["app"])
+			Expect(app.Status).To(Equal(types.ResourceStatusDeleted))
+			Expect(getStoredResource(ctx, dataStore, ids["db"]).Status).To(Equal(types.ResourceStatusDeleting))
+			Expect(deleteCalls[ids["app"]]).To(Equal(1))
+		})
+
+		It("does not redispatch after a stale deletion progress snapshot loses its claim", func() {
+			created, err := placementSvc.CreateRun(ctx, singleResourceRun("catalog-agent-error-delete-claim", map[string]any{"kind": "vm"}, nil))
+			Expect(err).NotTo(HaveOccurred())
+			resourceID := *created.Resources[0].Id
+			resource := getStoredResource(ctx, dataStore, resourceID)
+			agentName := *resource.AgentName
+			details := types.AgentErrorDetails{Error: "provider failed"}
+			accepted, err := dataStore.Resource().UpdateAgentError(ctx, resourceID, agentName, 21, details)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(accepted).To(BeTrue())
+			Expect(dataStore.Resource().UpdateStatus(ctx, resourceID, types.ResourceStatusFailed)).To(Succeed())
+
+			blockingResource := &blockingResourceStore{
+				Resource: dataStore.Resource(),
+				runID:    created.RunId,
+				snapshot: make(chan struct{}),
+				release:  make(chan struct{}),
+			}
+			placementSvc = service.NewPlacementService(&resourceOverrideStore{Store: dataStore, resource: blockingResource}, mockPolicy, mockSPRM, service.WithAgentClient(agentClient))
+			var releaseOnce sync.Once
+			releaseStaleSnapshot := func() { releaseOnce.Do(func() { close(blockingResource.release) }) }
+			defer releaseStaleSnapshot()
+
+			deleteCalls := 0
+			mockSPRM.DeleteResourceFunc = func(_ context.Context, id string) error {
+				deleteCalls++
+				if deleteCalls == 1 {
+					return placementSvc.OnResourceDeleted(ctx, id)
+				}
+				return nil
+			}
+
+			firstCall := make(chan error, 1)
+			go func() {
+				firstCall <- placementSvc.OnAgentError(ctx, resourceID, agentName, 21, details)
+			}()
+			Eventually(blockingResource.snapshot).Should(BeClosed())
+
+			Expect(placementSvc.OnAgentError(ctx, resourceID, agentName, 21, details)).To(Succeed())
+			Expect(getStoredResource(ctx, dataStore, resourceID).Status).To(Equal(types.ResourceStatusDeleted))
+			releaseStaleSnapshot()
+			Expect(<-firstCall).To(Succeed())
+
+			retained := getStoredResource(ctx, dataStore, resourceID)
+			Expect(retained.Status).To(Equal(types.ResourceStatusDeleted))
+			Expect(retained.CleanupIntent).To(Equal(string(store.CleanupIntentRollback)))
+			Expect(deleteCalls).To(Equal(1))
+		})
+
+		It("retains the complete run and agent error after automatic rollback completes", func() {
+			mockPolicy.EvaluateFunc = func(_ context.Context, req policy.EvaluateRequest) (*policy.EvaluateResponse, error) {
+				return &policy.EvaluateResponse{Status: "APPROVED", SelectedAgent: "test-agent", EvaluatedSpec: req.Spec}, nil
+			}
+			created, err := placementSvc.CreateRun(ctx, &types.CreateRunRequest{
+				CatalogItemInstanceId: "catalog-agent-error-retain",
+				RunId:                 uuid.New().String(),
+				Resources: []types.ResourceInput{
+					{Name: "db", Spec: map[string]any{"kind": "db"}},
+					{Name: "app", Spec: map[string]any{"kind": "app"}, RequiresResources: []string{"db"}},
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			ids := make(map[string]string)
+			for _, resource := range created.Resources {
+				ids[resource.Name] = *resource.Id
+			}
+			details := types.AgentErrorDetails{Error: "provider failed", Message: "rollback summary"}
+			mockSPRM.DeleteResourceFunc = func(context.Context, string) error { return nil }
+
+			Expect(placementSvc.OnAgentError(ctx, ids["db"], "test-agent", 11, details)).To(Succeed())
+			Expect(getStoredResource(ctx, dataStore, ids["app"]).Status).To(Equal(types.ResourceStatusDeleting))
+			Expect(placementSvc.OnResourceDeleted(ctx, ids["app"])).To(Succeed())
+			Expect(placementSvc.OnResourceDeleted(ctx, ids["db"])).To(Succeed())
+
+			resources, err := dataStore.Resource().ListByRunID(ctx, created.RunId)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resources).To(HaveLen(2))
+			for _, resource := range resources {
+				Expect(resource.CatalogItemInstanceId).To(Equal("catalog-agent-error-retain"))
+				Expect(resource.Status).To(Equal(types.ResourceStatusDeleted))
+			}
+			var failed model.Resource
+			for _, resource := range resources {
+				if resource.ID == ids["db"] {
+					failed = resource
+				}
+			}
+			Expect(failed.AgentErrorDetails).NotTo(BeNil())
+			Expect(*failed.AgentErrorDetails).To(Equal(details))
+			Expect(failed.AgentErrorStreamSequence).To(Equal(uint64(11)))
+		})
+
+		It("explicitly deletes a retained failed run without repeating external cleanup", func() {
+			mockPolicy.EvaluateFunc = func(_ context.Context, req policy.EvaluateRequest) (*policy.EvaluateResponse, error) {
+				return &policy.EvaluateResponse{Status: "APPROVED", SelectedAgent: "test-agent", EvaluatedSpec: req.Spec}, nil
+			}
+			created, err := placementSvc.CreateRun(ctx, singleResourceRun("catalog-agent-error-explicit-delete", map[string]any{"kind": "vm"}, nil))
+			Expect(err).NotTo(HaveOccurred())
+			resourceID := *created.Resources[0].Id
+			deleteCalls := 0
+			mockSPRM.DeleteResourceFunc = func(context.Context, string) error {
+				deleteCalls++
+				return nil
+			}
+
+			Expect(placementSvc.OnAgentError(ctx, resourceID, "test-agent", 12, types.AgentErrorDetails{Error: "provider failed"})).To(Succeed())
+			Expect(placementSvc.OnResourceDeleted(ctx, resourceID)).To(Succeed())
+			Expect(deleteCalls).To(Equal(1))
+			retained, err := dataStore.Resource().ListByRunID(ctx, created.RunId)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(retained).To(HaveLen(1))
+
+			Expect(placementSvc.DeleteRun(ctx, created.RunId)).To(Succeed())
+			removed, err := dataStore.Resource().ListByRunID(ctx, created.RunId)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(removed).To(BeEmpty())
+			Expect(deleteCalls).To(Equal(1))
+		})
+
+		It("lets explicit deletion override retention while rollback cleanup is in flight", func() {
+			mockPolicy.EvaluateFunc = func(_ context.Context, req policy.EvaluateRequest) (*policy.EvaluateResponse, error) {
+				return &policy.EvaluateResponse{Status: "APPROVED", SelectedAgent: "test-agent", EvaluatedSpec: req.Spec}, nil
+			}
+			created, err := placementSvc.CreateRun(ctx, &types.CreateRunRequest{
+				CatalogItemInstanceId: "catalog-agent-error-delete-in-flight",
+				RunId:                 uuid.New().String(),
+				Resources: []types.ResourceInput{
+					{Name: "db", Spec: map[string]any{"kind": "db"}},
+					{Name: "app", Spec: map[string]any{"kind": "app"}, RequiresResources: []string{"db"}},
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			ids := make(map[string]string)
+			for _, resource := range created.Resources {
+				ids[resource.Name] = *resource.Id
+			}
+			deleteCalls := make(map[string]int)
+			mockSPRM.DeleteResourceFunc = func(_ context.Context, id string) error {
+				deleteCalls[id]++
+				return nil
+			}
+
+			Expect(placementSvc.OnAgentError(ctx, ids["db"], "test-agent", 13, types.AgentErrorDetails{Error: "provider failed"})).To(Succeed())
+			Expect(deleteCalls[ids["app"]]).To(Equal(1))
+			Expect(placementSvc.DeleteRun(ctx, created.RunId)).To(Succeed())
+			Expect(deleteCalls[ids["app"]]).To(Equal(1))
+
+			Expect(placementSvc.OnResourceDeleted(ctx, ids["app"])).To(Succeed())
+			Expect(placementSvc.OnResourceDeleted(ctx, ids["db"])).To(Succeed())
+			resources, err := dataStore.Resource().ListByRunID(ctx, created.RunId)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resources).To(BeEmpty())
+			Expect(deleteCalls[ids["app"]]).To(Equal(1))
+			Expect(deleteCalls[ids["db"]]).To(Equal(1))
 		})
 
 		It("starts rollback on OnResourceFailed", func() {

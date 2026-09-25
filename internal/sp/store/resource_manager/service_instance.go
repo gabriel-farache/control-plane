@@ -57,11 +57,13 @@ type ServiceTypeInstance interface { //nolint:interfacebloat
 	ExistsByID(ctx context.Context, id string) (bool, error)
 	UpdateStatus(ctx context.Context, instanceID string, status string, statusMessage string, outputSpec map[string]any) error
 	UpdateStatusFrom(ctx context.Context, instanceID string, fromStatuses []string, agentName string, status string, statusMessage string) (bool, error)
+	UpdateAgentErrorFrom(ctx context.Context, instanceID string, fromStatuses []string, agentName string, streamSequence uint64, status string, statusMessage string) (bool, error)
 	MarkQueued(ctx context.Context, id string, agentName string) error
 	ReassignAndReset(ctx context.Context, id string, agentName string, expectedCurrentAgent string) error
 	MarkForDeletion(ctx context.Context, id string) error
 	ListPendingDeletions(ctx context.Context) ([]model.ServiceTypeInstance, error)
 	IncrementDeletionRetry(ctx context.Context, id string) error
+	ClaimDeletionAttempt(ctx context.Context, id string, expectedLastAttempt *time.Time) (bool, error)
 	MarkDeletionFailed(ctx context.Context, id string) error
 	MarkDeletionComplete(ctx context.Context, id string) error
 	HardDelete(ctx context.Context, id string) error
@@ -231,6 +233,32 @@ func (s *ServiceTypeInstanceStore) UpdateStatusFrom(ctx context.Context, instanc
 	return result.RowsAffected > 0, nil
 }
 
+// UpdateAgentErrorFrom applies a dcm.agent.error only when it is not older than
+// the last accepted event from the assigned agent.
+func (s *ServiceTypeInstanceStore) UpdateAgentErrorFrom(ctx context.Context, instanceID string, fromStatuses []string, agentName string, streamSequence uint64, status string, statusMessage string) (bool, error) {
+	result := s.db.WithContext(ctx).Model(&model.ServiceTypeInstance{}).Where(
+		"id = ? AND status IN ? AND agent_name = ? AND agent_error_stream_sequence < ?",
+		instanceID, fromStatuses, agentName, streamSequence,
+	).Updates(map[string]any{
+		"status":                      status,
+		"status_message":              statusMessage,
+		"agent_error_stream_sequence": streamSequence,
+	})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	if result.RowsAffected > 0 {
+		return true, nil
+	}
+
+	var count int64
+	err := s.db.WithContext(ctx).Model(&model.ServiceTypeInstance{}).Where(
+		"id = ? AND status IN ? AND agent_name = ? AND agent_error_stream_sequence = ?",
+		instanceID, fromStatuses, agentName, streamSequence,
+	).Count(&count).Error
+	return count > 0, err
+}
+
 // MarkQueued transitions an instance to "queued" and resets pending_started_at
 // so the queued-timeout sweep measures from the moment the agent queued the
 // request. Gated on agent_name in the same WHERE clause, same as UpdateStatusFrom.
@@ -324,7 +352,7 @@ func (s *ServiceTypeInstanceStore) MarkForDeletion(ctx context.Context, id strin
 	now := time.Now()
 	result := s.db.WithContext(ctx).
 		Model(&model.ServiceTypeInstance{}).
-		Where("id = ?", id).
+		Where("id = ? AND (deletion_status IS NULL OR deletion_status <> ?)", id, DeletionStatusScheduled).
 		Updates(map[string]any{
 			"deletion_status":       DeletionStatusScheduled,
 			"deletion_requested_at": now,
@@ -335,7 +363,13 @@ func (s *ServiceTypeInstanceStore) MarkForDeletion(ctx context.Context, id strin
 		return result.Error
 	}
 	if result.RowsAffected == 0 {
-		return ErrInstanceNotFound
+		exists, err := s.ExistsByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return ErrInstanceNotFound
+		}
 	}
 	return nil
 }
@@ -367,6 +401,29 @@ func (s *ServiceTypeInstanceStore) IncrementDeletionRetry(ctx context.Context, i
 		return ErrInstanceNotFound
 	}
 	return nil
+}
+
+func (s *ServiceTypeInstanceStore) ClaimDeletionAttempt(ctx context.Context, id string, expectedLastAttempt *time.Time) (bool, error) {
+	query := s.db.WithContext(ctx).Model(&model.ServiceTypeInstance{}).
+		Where("id = ? AND deletion_status = ?", id, DeletionStatusScheduled)
+	if expectedLastAttempt == nil {
+		query = query.Where("last_deletion_attempt IS NULL")
+	} else {
+		query = query.Where("last_deletion_attempt = ?", *expectedLastAttempt)
+	}
+
+	attemptedAt := time.Now()
+	if expectedLastAttempt != nil && attemptedAt.Sub(*expectedLastAttempt) < time.Microsecond {
+		attemptedAt = expectedLastAttempt.Add(time.Microsecond)
+	}
+	result := query.Updates(map[string]any{
+		"retry_count":           gorm.Expr("retry_count + 1"),
+		"last_deletion_attempt": attemptedAt,
+	})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
 }
 
 func (s *ServiceTypeInstanceStore) MarkDeletionFailed(ctx context.Context, id string) error {

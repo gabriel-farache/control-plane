@@ -386,6 +386,52 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 		})
 	})
 
+	Describe("UpdateAgentErrorFrom", func() {
+		It("keeps the latest stream sequence while allowing equal-sequence retries", func() {
+			agentName := "agent-a"
+			instance := newServiceTypeInstance("agent-error-order", map[string]any{})
+			instance.Status = model.StatusPending
+			instance.AgentName = &agentName
+			addInstanceToStore(instance)
+
+			accepted, err := s.UpdateAgentErrorFrom(ctx, instance.ID, []string{model.StatusPending, model.StatusFailed}, agentName, 2, model.StatusFailed, "second")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(accepted).To(BeTrue())
+
+			accepted, err = s.UpdateAgentErrorFrom(ctx, instance.ID, []string{model.StatusPending, model.StatusFailed}, agentName, 1, model.StatusFailed, "first")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(accepted).To(BeFalse())
+
+			accepted, err = s.UpdateAgentErrorFrom(ctx, instance.ID, []string{model.StatusPending, model.StatusFailed}, agentName, 2, model.StatusFailed, "second")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(accepted).To(BeTrue())
+
+			found, err := s.Get(ctx, instance.ID, false)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found.Status).To(Equal(model.StatusFailed))
+			Expect(found.StatusMessage).To(Equal("second"))
+			Expect(found.AgentErrorStreamSequence).To(Equal(uint64(2)))
+		})
+
+		It("rejects an error sequence from a superseded agent", func() {
+			currentAgent := "agent-b"
+			instance := newServiceTypeInstance("agent-error-stale", map[string]any{})
+			instance.Status = model.StatusPending
+			instance.AgentName = &currentAgent
+			addInstanceToStore(instance)
+
+			accepted, err := s.UpdateAgentErrorFrom(ctx, instance.ID, []string{model.StatusPending, model.StatusFailed}, "agent-a", 3, model.StatusFailed, "stale")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(accepted).To(BeFalse())
+
+			found, err := s.Get(ctx, instance.ID, false)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found.Status).To(Equal(model.StatusPending))
+			Expect(found.StatusMessage).To(BeEmpty())
+			Expect(found.AgentErrorStreamSequence).To(BeZero())
+		})
+	})
+
 	Describe("MarkQueued", func() {
 		It("transitions pending to queued and resets pending_started_at when agent_name matches", func() {
 			agentName := "agent-a"
@@ -736,6 +782,57 @@ var _ = Describe("ServiceTypeInstance Store", func() {
 		It("returns ErrInstanceNotFound for missing ID", func() {
 			err := s.IncrementDeletionRetry(ctx, uuid.New().String())
 			Expect(err).To(MatchError(rmstore.ErrInstanceNotFound))
+		})
+	})
+
+	Describe("ClaimDeletionAttempt", func() {
+		It("allows one claim from a snapshot and advances the attempt timestamp", func() {
+			inst := addInstanceToStore(newServiceTypeInstance("claim-delete-attempt", map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			pending, err := s.ListPendingDeletions(ctx)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pending).To(HaveLen(1))
+			staleAttempt := pending[0].LastDeletionAttempt
+
+			claimed, err := s.ClaimDeletionAttempt(ctx, inst.ID, staleAttempt)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claimed).To(BeTrue())
+			claimed, err = s.ClaimDeletionAttempt(ctx, inst.ID, staleAttempt)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claimed).To(BeFalse())
+
+			found, err := s.Get(ctx, inst.ID, true)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found.RetryCount).To(Equal(1))
+			Expect(found.LastDeletionAttempt).NotTo(BeNil())
+			firstAttempt := found.LastDeletionAttempt
+
+			claimed, err = s.ClaimDeletionAttempt(ctx, inst.ID, found.LastDeletionAttempt)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claimed).To(BeTrue())
+			found, err = s.Get(ctx, inst.ID, true)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found.RetryCount).To(Equal(2))
+			Expect(found.LastDeletionAttempt.After(*firstAttempt)).To(BeTrue())
+		})
+	})
+
+	Describe("MarkForDeletion", func() {
+		It("preserves an in-flight attempt when the row is scheduled again", func() {
+			inst := addInstanceToStore(newServiceTypeInstance("mark-delete-in-flight", map[string]any{}))
+			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+			claimed, err := s.ClaimDeletionAttempt(ctx, inst.ID, nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(claimed).To(BeTrue())
+			before, err := s.Get(ctx, inst.ID, true)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(s.MarkForDeletion(ctx, inst.ID)).To(Succeed())
+
+			after, err := s.Get(ctx, inst.ID, true)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(after.RetryCount).To(Equal(before.RetryCount))
+			Expect(after.LastDeletionAttempt).To(Equal(before.LastDeletionAttempt))
 		})
 	})
 

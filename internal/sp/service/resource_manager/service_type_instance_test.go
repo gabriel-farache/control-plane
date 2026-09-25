@@ -3,15 +3,19 @@ package resource_manager_test
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/dcm-project/control-plane/api/sp/v1alpha1/resource_manager"
 	agentStoreImpl "github.com/dcm-project/control-plane/internal/agent/store/agent"
 	agentmodel "github.com/dcm-project/control-plane/internal/agent/store/model"
+	"github.com/dcm-project/control-plane/internal/sp/cleanup"
+	"github.com/dcm-project/control-plane/internal/sp/config"
 	"github.com/dcm-project/control-plane/internal/sp/messaging"
 	"github.com/dcm-project/control-plane/internal/sp/service"
 	rmsvc "github.com/dcm-project/control-plane/internal/sp/service/resource_manager"
 	"github.com/dcm-project/control-plane/internal/sp/store"
 	"github.com/dcm-project/control-plane/internal/sp/store/model"
+	rmstore "github.com/dcm-project/control-plane/internal/sp/store/resource_manager"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go/jetstream"
 	. "github.com/onsi/ginkgo/v2"
@@ -25,10 +29,49 @@ import (
 // agent-routed CreateInstance/ReassignAgent paths without a real NATS server.
 type stubJetStream struct {
 	jetstream.JetStream
+	onPublish  func(context.Context, string, []byte)
+	publishErr error
 }
 
-func (s *stubJetStream) Publish(_ context.Context, _ string, _ []byte, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
-	return &jetstream.PubAck{}, nil
+func (s *stubJetStream) Publish(ctx context.Context, subject string, data []byte, _ ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
+	if s.onPublish != nil {
+		s.onPublish(ctx, subject, data)
+	}
+	return &jetstream.PubAck{}, s.publishErr
+}
+
+type serviceInstanceStoreOverride struct {
+	store.Store
+	instance rmstore.ServiceTypeInstance
+}
+
+func (s *serviceInstanceStoreOverride) ServiceTypeInstance() rmstore.ServiceTypeInstance {
+	return s.instance
+}
+
+type capturePendingDeletionSnapshot struct {
+	rmstore.ServiceTypeInstance
+	snapshot *[]model.ServiceTypeInstance
+}
+
+func (s *capturePendingDeletionSnapshot) MarkForDeletion(ctx context.Context, id string) error {
+	if err := s.ServiceTypeInstance.MarkForDeletion(ctx, id); err != nil {
+		return err
+	}
+	pending, err := s.ServiceTypeInstance.ListPendingDeletions(ctx)
+	if err == nil {
+		*s.snapshot = pending
+	}
+	return err
+}
+
+type stalePendingDeletionSnapshot struct {
+	rmstore.ServiceTypeInstance
+	snapshot []model.ServiceTypeInstance
+}
+
+func (s *stalePendingDeletionSnapshot) ListPendingDeletions(context.Context) ([]model.ServiceTypeInstance, error) {
+	return s.snapshot, nil
 }
 
 func ptrString(s string) *string { return &s }
@@ -38,6 +81,7 @@ var _ = Describe("InstanceService", func() {
 		db              *gorm.DB
 		dataStore       store.Store
 		instanceService *rmsvc.InstanceService
+		publishStub     *stubJetStream
 		ctx             context.Context
 	)
 
@@ -51,7 +95,8 @@ var _ = Describe("InstanceService", func() {
 		Expect(db.Create(&agentmodel.Agent{ID: uuid.New().String(), Name: "test-agent", TopicName: "dcm.agent.test-agent", HealthStatus: agentmodel.AgentHealthStatusReady, ServiceTypes: []string{"vm", "container"}}).Error).NotTo(HaveOccurred())
 
 		dataStore = store.NewStore(db)
-		pub := messaging.NewPublisher(&stubJetStream{})
+		publishStub = &stubJetStream{}
+		pub := messaging.NewPublisher(publishStub)
 		instanceService = rmsvc.NewInstanceService(dataStore, pub, agentStoreImpl.NewAgent(db))
 		ctx = context.Background()
 	})
@@ -364,6 +409,167 @@ var _ = Describe("InstanceService", func() {
 	})
 
 	Describe("DeleteInstance (agent-routed)", func() {
+		It("persists deleting status and cleanup enrollment before publishing", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID: uuid.New().String(), ServiceType: "vm", Status: "running",
+				InstanceName: "ordered-delete", Spec: map[string]any{"cpu": 2}, AgentName: &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+
+			published := false
+			publishStub.onPublish = func(_ context.Context, _ string, _ []byte) {
+				var stored model.ServiceTypeInstance
+				Expect(db.First(&stored, "id = ?", inst.ID).Error).To(Succeed())
+				Expect(stored.Status).To(Equal(model.StatusDeleting))
+				Expect(stored.DeletionStatus).NotTo(BeNil())
+				Expect(*stored.DeletionStatus).To(Equal("SCHEDULED"))
+				published = true
+			}
+
+			Expect(instanceService.DeleteInstance(ctx, inst.ID, false)).To(Succeed())
+			Expect(published).To(BeTrue())
+		})
+
+		It("does not publish when persisting deleting status fails", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID: uuid.New().String(), ServiceType: "vm", Status: "running",
+				InstanceName: "failed-status-delete", Spec: map[string]any{"cpu": 2}, AgentName: &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+			Expect(db.Exec("CREATE TRIGGER fail_deleting_status BEFORE UPDATE OF status ON service_type_instances WHEN NEW.status = 'deleting' BEGIN SELECT RAISE(ABORT, 'forced status failure'); END").Error).NotTo(HaveOccurred())
+
+			publishCount := 0
+			publishStub.onPublish = func(context.Context, string, []byte) { publishCount++ }
+			err := instanceService.DeleteInstance(ctx, inst.ID, false)
+
+			Expect(err).To(HaveOccurred())
+			Expect(publishCount).To(BeZero())
+			var stored model.ServiceTypeInstance
+			Expect(db.First(&stored, "id = ?", inst.ID).Error).To(Succeed())
+			Expect(stored.Status).To(Equal("running"))
+			Expect(stored.DeletionStatus).To(BeNil())
+		})
+
+		It("does not publish when cleanup enrollment fails", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID: uuid.New().String(), ServiceType: "vm", Status: "running",
+				InstanceName: "failed-enrollment-delete", Spec: map[string]any{"cpu": 2}, AgentName: &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+			Expect(db.Exec("CREATE TRIGGER fail_deletion_enrollment BEFORE UPDATE OF deletion_status ON service_type_instances WHEN NEW.deletion_status = 'SCHEDULED' BEGIN SELECT RAISE(ABORT, 'forced enrollment failure'); END").Error).NotTo(HaveOccurred())
+
+			publishCount := 0
+			publishStub.onPublish = func(context.Context, string, []byte) { publishCount++ }
+			Expect(instanceService.DeleteInstance(ctx, inst.ID, false)).To(HaveOccurred())
+			Expect(publishCount).To(BeZero())
+			var stored model.ServiceTypeInstance
+			Expect(db.First(&stored, "id = ?", inst.ID).Error).To(Succeed())
+			Expect(stored.Status).To(Equal(model.StatusDeleting))
+			Expect(stored.DeletionStatus).To(BeNil())
+		})
+
+		It("leaves a failed publication enrolled for cleanup retry", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID: uuid.New().String(), ServiceType: "vm", Status: "running",
+				InstanceName: "retry-publish-delete", Spec: map[string]any{"cpu": 2}, AgentName: &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+			publishStub.publishErr = errors.New("temporary publish failure")
+
+			Expect(instanceService.DeleteInstance(ctx, inst.ID, false)).To(HaveOccurred())
+			var stored model.ServiceTypeInstance
+			Expect(db.First(&stored, "id = ?", inst.ID).Error).To(Succeed())
+			Expect(stored.Status).To(Equal(model.StatusDeleting))
+			Expect(stored.DeletionStatus).NotTo(BeNil())
+			Expect(*stored.DeletionStatus).To(Equal("SCHEDULED"))
+		})
+		It("does not republish an already scheduled non-deferred delete on caller retry", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID: uuid.New().String(), ServiceType: "vm", Status: "running",
+				InstanceName: "retry-already-scheduled-delete", Spec: map[string]any{"cpu": 2}, AgentName: &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+			publishCount := 0
+			publishStub.onPublish = func(context.Context, string, []byte) { publishCount++ }
+			publishStub.publishErr = errors.New("ambiguous publish failure")
+
+			Expect(instanceService.DeleteInstance(ctx, inst.ID, false)).To(HaveOccurred())
+			attemptsAfterFirstCall := publishCount
+			Expect(attemptsAfterFirstCall).To(BeNumerically(">", 0))
+			publishStub.publishErr = nil
+
+			Expect(instanceService.DeleteInstance(ctx, inst.ID, false)).To(Succeed())
+			Expect(publishCount).To(Equal(attemptsAfterFirstCall))
+		})
+
+		It("does not republish an already scheduled deferred delete", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID: uuid.New().String(), ServiceType: "vm", Status: "running",
+				InstanceName: "retry-already-scheduled-deferred-delete", Spec: map[string]any{"cpu": 2}, AgentName: &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+			publishCount := 0
+			publishStub.onPublish = func(context.Context, string, []byte) { publishCount++ }
+
+			Expect(instanceService.DeleteInstance(ctx, inst.ID, true)).To(Succeed())
+			Expect(publishCount).To(Equal(1))
+			Expect(instanceService.DeleteInstance(ctx, inst.ID, true)).To(Succeed())
+			Expect(publishCount).To(Equal(1))
+		})
+
+		It("does not let a stale cleanup snapshot duplicate the direct delete publish", func() {
+			agentName := "test-agent"
+			inst := model.ServiceTypeInstance{
+				ID: uuid.New().String(), ServiceType: "vm", Status: "running",
+				InstanceName: "direct-cleanup-race", Spec: map[string]any{"cpu": 2}, AgentName: &agentName,
+			}
+			Expect(db.Create(&inst).Error).NotTo(HaveOccurred())
+			var staleSnapshot []model.ServiceTypeInstance
+			capturingStore := &capturePendingDeletionSnapshot{
+				ServiceTypeInstance: dataStore.ServiceTypeInstance(),
+				snapshot:            &staleSnapshot,
+			}
+			directService := rmsvc.NewInstanceService(
+				&serviceInstanceStoreOverride{Store: dataStore, instance: capturingStore},
+				messaging.NewPublisher(publishStub), agentStoreImpl.NewAgent(db),
+			)
+			publishCount := 0
+			publishStub.onPublish = func(context.Context, string, []byte) { publishCount++ }
+
+			Expect(directService.DeleteInstance(ctx, inst.ID, false)).To(Succeed())
+			Expect(staleSnapshot).To(HaveLen(1))
+			Expect(staleSnapshot[0].LastDeletionAttempt).To(BeNil())
+
+			schedulerStore := &serviceInstanceStoreOverride{
+				Store: dataStore,
+				instance: &stalePendingDeletionSnapshot{
+					ServiceTypeInstance: dataStore.ServiceTypeInstance(),
+					snapshot:            staleSnapshot,
+				},
+			}
+			scheduler := cleanup.NewScheduler(
+				schedulerStore, messaging.NewPublisher(publishStub), agentStoreImpl.NewAgent(db),
+				&config.CleanupConfig{MaxRetries: 3},
+			)
+			scheduler.ProcessPendingDeletions(ctx)
+			scheduler = cleanup.NewScheduler(
+				dataStore, messaging.NewPublisher(publishStub), agentStoreImpl.NewAgent(db),
+				&config.CleanupConfig{Interval: time.Hour, MaxRetries: 3},
+			)
+			scheduler.ProcessPendingDeletions(ctx)
+
+			Expect(publishCount).To(Equal(1))
+			found, err := dataStore.ServiceTypeInstance().Get(ctx, inst.ID, true)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(found.RetryCount).To(Equal(1))
+		})
+
 		It("publishes delete event and marks deleting, awaiting agent acknowledgement, for non-deferred deletion", func() {
 			agentName := "test-agent"
 			inst := model.ServiceTypeInstance{

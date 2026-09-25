@@ -7,6 +7,7 @@ import (
 	agentmodel "github.com/dcm-project/control-plane/internal/agent/store/model"
 	"github.com/dcm-project/control-plane/internal/placement/store"
 	"github.com/dcm-project/control-plane/internal/placement/store/model"
+	placementtypes "github.com/dcm-project/control-plane/internal/placement/types"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -486,6 +487,93 @@ var _ = Describe("Resource Store", func() {
 			applied, err := requestStore.UpdateStatusFrom(ctx, uuid.New().String(), nil, "RUNNING")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(applied).To(BeFalse())
+		})
+	})
+
+	Describe("PrepareRunDeletion", func() {
+		It("records cleanup intent and preserves deleted or in-flight resource states", func() {
+			agent := "test-agent"
+			approval := "APPROVED"
+			rows := []model.Resource{
+				{ID: uuid.New().String(), RunID: "run-cleanup-intent", Name: "pending", CatalogItemInstanceId: "cat", Spec: map[string]any{}, AgentName: &agent, ApprovalStatus: &approval, Path: "resources/pending", Status: "PENDING", DagLevel: 0},
+				{ID: uuid.New().String(), RunID: "run-cleanup-intent", Name: "deleting", CatalogItemInstanceId: "cat", Spec: map[string]any{}, AgentName: &agent, ApprovalStatus: &approval, Path: "resources/deleting", Status: "DELETING", DagLevel: 1},
+				{ID: uuid.New().String(), RunID: "run-cleanup-intent", Name: "deleted", CatalogItemInstanceId: "cat", Spec: map[string]any{}, AgentName: &agent, ApprovalStatus: &approval, Path: "resources/deleted", Status: "DELETED", DagLevel: 2},
+			}
+			_, err := requestStore.CreateBatch(ctx, rows)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(requestStore.PrepareRunDeletion(ctx, "run-cleanup-intent", store.CleanupIntentRollback)).To(Succeed())
+			listed, err := requestStore.ListByRunID(ctx, "run-cleanup-intent")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(listed[0].Status).To(Equal("PENDING_DELETION"))
+			Expect(listed[0].CleanupIntent).To(Equal(string(store.CleanupIntentRollback)))
+			Expect(listed[1].Status).To(Equal("DELETING"))
+			Expect(listed[1].CleanupIntent).To(Equal(string(store.CleanupIntentRollback)))
+			Expect(listed[2].Status).To(Equal("DELETED"))
+			Expect(listed[2].CleanupIntent).To(Equal(string(store.CleanupIntentRollback)))
+
+			Expect(requestStore.PrepareRunDeletion(ctx, "run-cleanup-intent", store.CleanupIntentExplicit)).To(Succeed())
+			Expect(requestStore.PrepareRunDeletion(ctx, "run-cleanup-intent", store.CleanupIntentRollback)).To(Succeed())
+			listed, err = requestStore.ListByRunID(ctx, "run-cleanup-intent")
+			Expect(err).NotTo(HaveOccurred())
+			for _, resource := range listed {
+				Expect(resource.CleanupIntent).To(Equal(string(store.CleanupIntentExplicit)))
+			}
+		})
+
+		It("returns ErrResourceNotFound for an empty run", func() {
+			Expect(requestStore.PrepareRunDeletion(ctx, "missing-run", store.CleanupIntentExplicit)).To(Equal(store.ErrResourceNotFound))
+		})
+	})
+
+	Describe("UpdateAgentError", func() {
+		It("stores only non-older details for the assigned agent and accepts a sequence retry", func() {
+			agent := "test-agent"
+			approval := "APPROVED"
+			id := uuid.New().String()
+			_, err := requestStore.Create(ctx, model.Resource{
+				ID:                    id,
+				RunID:                 "run-agent-error",
+				Name:                  "main",
+				CatalogItemInstanceId: "cat-agent-error",
+				Spec:                  map[string]any{},
+				AgentName:             &agent,
+				ApprovalStatus:        &approval,
+				Path:                  "resources/" + id,
+				Status:                "PENDING",
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			statusCode := 503
+			latest := placementtypes.AgentErrorDetails{
+				Error:   "latest failure",
+				Message: "latest summary",
+				ProviderError: &placementtypes.AgentProviderError{
+					StatusCode: &statusCode,
+					Message:    "latest provider body",
+				},
+			}
+			accepted, err := requestStore.UpdateAgentError(ctx, id, agent, 2, latest)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(accepted).To(BeTrue())
+
+			accepted, err = requestStore.UpdateAgentError(ctx, id, agent, 1, placementtypes.AgentErrorDetails{Error: "old failure"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(accepted).To(BeFalse())
+
+			accepted, err = requestStore.UpdateAgentError(ctx, id, agent, 2, latest)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(accepted).To(BeTrue())
+
+			accepted, err = requestStore.UpdateAgentError(ctx, id, "superseded-agent", 3, placementtypes.AgentErrorDetails{Error: "stale agent"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(accepted).To(BeFalse())
+
+			stored, err := requestStore.Get(ctx, id)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(stored.AgentErrorStreamSequence).To(Equal(uint64(2)))
+			Expect(stored.AgentErrorDetails).NotTo(BeNil())
+			Expect(*stored.AgentErrorDetails).To(Equal(latest))
 		})
 	})
 

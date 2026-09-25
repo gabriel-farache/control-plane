@@ -129,12 +129,27 @@ func (s *Scheduler) processOne(ctx context.Context, instance model.ServiceTypeIn
 		return
 	}
 
+	if s.interval > 0 && instance.LastDeletionAttempt != nil && time.Since(*instance.LastDeletionAttempt) < s.interval {
+		log.Debug("cleanup: deletion attempt is not due yet", "instance_id", instance.ID)
+		return
+	}
+
 	if s.maxRetries > 0 && instance.RetryCount >= s.maxRetries {
 		log.Warn("cleanup audit: deletion retries exhausted, marking FAILED for manual intervention",
 			"instance_id", instance.ID, "agent_name", *instance.AgentName, "retry_count", instance.RetryCount, "reason", "retries_exhausted")
 		if err := s.store.ServiceTypeInstance().MarkDeletionFailed(ctx, instance.ID); err != nil {
 			log.Error("Failed to mark instance deletion as FAILED", "instance_id", instance.ID, "error", err)
 		}
+		return
+	}
+
+	claimed, err := s.store.ServiceTypeInstance().ClaimDeletionAttempt(ctx, instance.ID, instance.LastDeletionAttempt)
+	if err != nil {
+		log.Error("Failed to claim deletion retry attempt", "instance_id", instance.ID, "error", err)
+		return
+	}
+	if !claimed {
+		log.Debug("cleanup: deletion attempt was claimed since the pending list was read", "instance_id", instance.ID)
 		return
 	}
 
@@ -146,13 +161,6 @@ func (s *Scheduler) processOne(ctx context.Context, instance model.ServiceTypeIn
 		log.Warn("cleanup: delete publish failed, will retry next cycle", "instance_id", instance.ID, "error", pubErr)
 	} else {
 		log.Info("cleanup: delete published, awaiting agent acknowledgement", "instance_id", instance.ID)
-	}
-
-	// Every attempt counts toward maxRetries whether or not the publish
-	// itself succeeded, so a permanently unreachable NATS/agent eventually
-	// trips the retries-exhausted branch above instead of retrying forever.
-	if err := s.store.ServiceTypeInstance().IncrementDeletionRetry(ctx, instance.ID); err != nil {
-		log.Error("Failed to record deletion retry attempt", "instance_id", instance.ID, "error", err)
 	}
 }
 
